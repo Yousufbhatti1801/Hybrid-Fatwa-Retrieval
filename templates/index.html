@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="ur" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>اسلامی فتاویٰ — Islamic Fatawa RAG</title>
+
+  <!-- Google Fonts: Noto Nastaliq Urdu for Urdu, Inter for Latin -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Nastaliq+Urdu:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+
+<body>
+  <!-- ── Decorative top band ──────────────────────────────────────────── -->
+  <div class="top-band">
+    <span class="bismillah">بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ</span>
+  </div>
+
+  <!-- ── Main layout ──────────────────────────────────────────────────── -->
+  <div class="layout">
+
+    <!-- ── Sidebar ──────────────────────────────────────────────────── -->
+    <aside class="sidebar">
+      <div class="logo-wrap">
+        <div class="logo-icon">☾</div>
+        <div class="logo-text">
+          <span class="logo-ur">فتاویٰ سسٹم</span>
+          <span class="logo-en">Islamic Fatawa RAG</span>
+        </div>
+      </div>
+
+      <!-- Category filter -->
+      <div class="sidebar-section">
+        <h3 class="sidebar-label">زمرہ — Category</h3>
+        <div class="cat-list" id="catList">
+          {% for cat in categories %}
+          <button
+            class="cat-btn {% if loop.first %}active{% endif %}"
+            data-cat="{{ cat }}"
+          >
+            <span class="cat-icon">{{ cat_icon(cat) }}</span>
+            <span class="cat-name">{{ cat_display(cat) }}</span>
+          </button>
+          {% endfor %}
+        </div>
+      </div>
+
+      <!-- Settings -->
+      <div class="sidebar-section settings-section">
+        <h3 class="sidebar-label">ترتیبات — Settings</h3>
+        <label class="toggle-row">
+          <span>Guardrails</span>
+          <input type="checkbox" id="guardrailsToggle" {% if guardrails_on %}checked{% endif %} />
+          <span class="toggle-slider"></span>
+        </label>
+        <label class="toggle-row">
+          <span>Validate Output</span>
+          <input type="checkbox" id="validateToggle" checked />
+          <span class="toggle-slider"></span>
+        </label>
+        <div class="topk-row">
+          <span>نتائج — Results</span>
+          <input type="number" id="topKInput" value="5" min="1" max="20" class="topk-input" />
+        </div>
+      </div>
+
+      {% if dry_run %}
+      <div class="dry-run-badge">🔵 Dry-Run Mode</div>
+      {% endif %}
+
+      <!-- History list -->
+      <div class="sidebar-section history-section">
+        <h3 class="sidebar-label">تاریخ — History</h3>
+        <ul class="history-list" id="historyList"></ul>
+      </div>
+    </aside>
+
+    <!-- ── Chat area ─────────────────────────────────────────────────── -->
+    <main class="chat-area">
+
+      <!-- Welcome / empty state -->
+      <div class="welcome-state" id="welcomeState">
+        <div class="welcome-icon">☾</div>
+        <h1 class="welcome-title">اسلامی فتاویٰ نظام</h1>
+        <p class="welcome-sub">Islamic Fatawa Retrieval-Augmented Generation</p>
+        <p class="welcome-desc">
+          اپنا سوال نیچے لکھیں — کوئی بھی اسلامی مسئلہ، فقہی سوال یا شرعی حکم۔
+        </p>
+        <div class="suggestion-chips">
+          <button class="chip" data-q="نماز قصر کے احکام کیا ہیں؟">نماز قصر</button>
+          <button class="chip" data-q="زکوٰۃ کا نصاب کیا ہے؟">زکوٰۃ نصاب</button>
+          <button class="chip" data-q="وضو کن چیزوں سے ٹوٹتا ہے؟">ناقضِ وضو</button>
+          <button class="chip" data-q="روزے کی حالت میں کیا چیزیں روزہ توڑتی ہیں؟">روزہ</button>
+          <button class="chip" data-q="حج فرض ہونے کی کیا شرائط ہیں؟">فرضیتِ حج</button>
+          <button class="chip" data-q="نکاح کی شرائط کیا ہیں؟">نکاح</button>
+        </div>
+      </div>
+
+      <!-- Message thread -->
+      <div class="messages" id="messages"></div>
+
+      <!-- Input bar -->
+      <div class="input-bar">
+        <div class="input-wrap">
+          <textarea
+            id="questionInput"
+            class="question-input"
+            placeholder="اپنا سوال یہاں لکھیں…"
+            rows="1"
+            dir="rtl"
+          ></textarea>
+          <button class="send-btn" id="sendBtn" title="سوال بھیجیں">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"></line>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+            </svg>
+          </button>
+        </div>
+        <p class="input-hint">Enter ↵ سوال بھیجیں — Shift+Enter نئی سطر</p>
+      </div>
+    </main>
+
+  </div><!-- /layout -->
+
+  <!-- ── Source detail modal ──────────────────────────────────────────── -->
+  <div class="modal-overlay" id="modalOverlay">
+    <div class="modal" id="modal">
+      <button class="modal-close" id="modalClose">✕</button>
+      <h2 class="modal-title">ماخذ — Sources</h2>
+      <div id="modalBody"></div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,41 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python virtual env
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Notebook and editor
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Project runtime artifacts
+.bm25_cache.pkl
+embed_checkpoint.db
+.pipeline_cache/
+_e2e_orch_work/
+_e2e_report.json
+_e2e_index_summary.json
+_full_run_summary.json
+_index_run_summary.json
+_ingest_banuri_summary.json
+*.log
+
+# Large corpus data
+data/
