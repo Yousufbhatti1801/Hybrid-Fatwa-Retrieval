@@ -47,7 +47,13 @@ def _batched(iterable, n: int) -> Iterator[list]:
 
 @lru_cache(maxsize=1)
 def _get_client() -> OpenAI:
-    return OpenAI(api_key=get_settings().openai_api_key)
+    # max_retries=1 disables the SDK's silent internal retries.
+    # We manage retries via _call_with_retry() in this file.
+    return OpenAI(
+        api_key=get_settings().openai_api_key,
+        max_retries=1,
+        timeout=10.0,
+    )
 
 
 def _jitter(delay: float) -> float:
@@ -66,11 +72,15 @@ def _call_with_retry(client: OpenAI, texts: list[str]) -> list[list[float]]:
 
     for attempt in range(1, settings.embed_max_retries + 1):
         try:
+            # Explicit timeout — OpenAI SDK default is 600s and has its
+            # own internal retries that can silently add 10+s to cold calls.
+            # We manage retries ourselves via this loop.
             response = client.embeddings.create(
                 input=texts,
                 model=settings.embedding_model,
                 dimensions=settings.embedding_dimensions,
                 encoding_format="float",
+                timeout=8.0,
             )
             return [item.embedding for item in response.data]
 
@@ -130,13 +140,13 @@ def _safe_batches(chunks: list[Chunk], max_items: int) -> Iterator[list[Chunk]]:
 
 # ── Public API ───────────────────────────────────────────────────────────────────
 
-@lru_cache(maxsize=1024)
+@lru_cache(maxsize=4096)
 def embed_single(text: str) -> tuple[float, ...]:
     """Embed a single text string with retry logic (used at query time).
 
-    Results are cached (up to 1024 unique queries) so repeated questions
-    skip the OpenAI API call entirely.  Returns a tuple (hashable) so
-    the LRU cache can store it.
+    Results are cached (up to 4096 unique queries) so repeated questions
+    skip the OpenAI API call entirely (~500-2000ms saved per hit).
+    Returns a tuple (hashable) so the LRU cache can store it.
     """
     client = _get_client()
     return tuple(_call_with_retry(client, [text])[0])

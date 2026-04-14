@@ -619,12 +619,14 @@ def run_guardrails(
 def guarded_query(
     question: str,
     *,
+    retrieval_query: str | None = None,
     config: GuardrailConfig | None = None,
     top_k: int | None = None,
     dense_weight: float | None = None,
     sparse_weight: float | None = None,
     context_token_budget: int | None = None,
     category: str | None = None,
+    maslak: str | None = None,
     bm25_corpus: Any | None = None,
 ) -> GuardedResult:
     """Run the full RAG pipeline wrapped with all five guardrails.
@@ -707,7 +709,8 @@ def guarded_query(
             raw_answer="",
         )
 
-    normalised = normalize_urdu(question)
+    retrieval_text = retrieval_query or question
+    normalised = normalize_urdu(retrieval_text)
     try:
         retrieved = hybrid_search(
             normalised,
@@ -715,6 +718,7 @@ def guarded_query(
             dense_weight=dense_weight,
             sparse_weight=sparse_weight,
             category=category,
+            maslak=maslak,
             bm25_corpus=bm25_corpus,
         )
     except Exception as _retrieval_exc:  # noqa: BLE001

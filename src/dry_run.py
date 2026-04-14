@@ -324,6 +324,7 @@ def _mock_hybrid_search(
     bm25_corpus: Any = None,
     *,
     category: str | None = None,
+    maslak: str | None = None,   # accepted for parity with the live signature
     question_boost: float = 0.15,
 ) -> list[dict]:
     """Mock for ``src.retrieval.hybrid_retriever.hybrid_search``.
@@ -597,6 +598,104 @@ class MockOpenAI:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PageIndex (vectorless mode) — deterministic mocks for the 4-school search
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PI_SCHOOLS = ("Banuri", "fatwaqa", "IslamQA", "urdufatwa")
+_PI_LABELS = {
+    "Banuri":    "Banuri Town — Deobandi",
+    "fatwaqa":   "FatwaQA — Ahle Hadees",
+    "IslamQA":   "IslamQA — Ahle Hadees",
+    "urdufatwa": "UrduFatwa — Barelvi",
+}
+
+
+def _mock_pi_extract_core_question(raw_query: str, **_kw: Any) -> dict:
+    """Deterministic stand-in for ``pipeline_pageindex.extract_core_question``."""
+    return {
+        "core_question":     (raw_query or "").strip() or "test question",
+        "category_hint":     "OTHER",
+        "keywords":          [w for w in (raw_query or "").split() if len(w) > 2][:5],
+        "schools_to_search": list(_PI_SCHOOLS),
+    }
+
+
+_PI_MASLAK_MOCK = {
+    "Banuri":    "Deobandi",
+    "fatwaqa":   "Ahle Hadees",
+    "IslamQA":   "Ahle Hadees",
+    "urdufatwa": "Barelvi",
+}
+
+
+def _mock_pi_search(
+    core_question: str,
+    *,
+    category_hint: str | None = None,
+    keywords: list[str] | None = None,
+    schools: list[str] | None = None,
+    top_n: int = 4,
+    **_kw: Any,
+) -> list[dict]:
+    """Deterministic stand-in for ``search_pageindex.pageindex_search``.
+
+    Returns one fabricated card per school (each with a ``fatawa`` list
+    of ``top_n`` mocked entries) so the dry-run UI flow can be exercised
+    without any LLM call or built tree/lookup.
+    """
+    schools = schools or list(_PI_SCHOOLS)
+    out: list[dict] = []
+    for sid in schools:
+        fatawa = []
+        for i in range(1, max(1, top_n) + 1):
+            fatawa.append({
+                "fatwa_id":      f"dry__{sid}__OTHER__dry_run__DRY-RUN-{sid}-{i:03d}_0",
+                "fatwa_no":      f"DRY-RUN-{sid}-{i:03d}",
+                "category":      category_hint or "OTHER",
+                "subtopic":      "dry_run",
+                "query_text":    f"{core_question} (variant {i})",
+                "question_text": f"[DRY-RUN {sid} #{i}] {core_question}",
+                "answer_text":   (
+                    f"یہ ایک dry-run جواب ہے ({sid} #{i})۔ "
+                    "اصل LLM یا tree استعمال نہیں ہوا۔"
+                ),
+                "url":           "",
+                "relevance_pct": max(20, 90 - (i - 1) * 15),
+            })
+        primary = fatawa[0]
+        out.append({
+            "school_id":     sid,
+            "school_label":  _PI_LABELS.get(sid, sid),
+            "maslak":        _PI_MASLAK_MOCK.get(sid, ""),
+            "fatwa_id":      primary["fatwa_id"],
+            "fatwa_no":      primary["fatwa_no"],
+            "category":      primary["category"],
+            "subtopic":      primary["subtopic"],
+            "query_text":    primary["query_text"],
+            "question_text": primary["question_text"],
+            "answer_text":   primary["answer_text"],
+            "url":           primary["url"],
+            "relevance_pct": primary["relevance_pct"],
+            "fatawa":        fatawa,
+            "navigation":    {"reason": "dry-run mock", "llm_reranked": True},
+        })
+    return out
+
+
+def _mock_pi_summarise(self: Any, fatwa_id: str, **_kw: Any) -> dict:
+    """Stand-in for ``PageIndexClient.summarise``."""
+    return {
+        "fatwa_id": fatwa_id,
+        "summary":  "[DRY-RUN] یہ ایک نمونہ خلاصہ ہے، کوئی LLM کال نہیں ہوئی۔",
+    }
+
+
+def _mock_pi_preload(self: Any) -> None:
+    """No-op preload for PageIndexClient."""
+    pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Patch table
 # ─────────────────────────────────────────────────────────────────────────────
 # Each entry is (dotted.target.path, replacement).
@@ -620,6 +719,15 @@ _PATCH_TABLE: list[tuple[str, Any]] = [
     # rag.py imports OpenAI at module level; guardrails imports it locally
     ("src.pipeline.rag.OpenAI",                      MockOpenAI),
     ("openai.OpenAI",                                MockOpenAI),
+    # ── PageIndex (vectorless mode) ───────────────────────────────────────
+    # Patches at the import sites used by app.py and pageindex.client.
+    # Each patch is silently skipped if its target module isn't installed.
+    ("pageindex.pipeline_pageindex.extract_core_question", _mock_pi_extract_core_question),
+    ("pageindex.client.extract_core_question",             _mock_pi_extract_core_question),
+    ("pageindex.search_pageindex.pageindex_search",        _mock_pi_search),
+    ("pageindex.client.pageindex_search",                  _mock_pi_search),
+    ("pageindex.client.PageIndexClient.summarise",         _mock_pi_summarise),
+    ("pageindex.client.PageIndexClient.preload",           _mock_pi_preload),
 ]
 
 

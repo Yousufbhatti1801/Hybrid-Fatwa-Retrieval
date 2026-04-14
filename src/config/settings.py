@@ -15,8 +15,8 @@ class Settings(BaseSettings):
 
     # ── OpenAI ───────────────────────────────────────────────
     openai_api_key: str
-    embedding_model: str = "text-embedding-3-large"
-    embedding_dimensions: int = 3072
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dimensions: int = 1536
     chat_model: str = "gpt-4o-mini"
 
     # ── Embedding retry ──────────────────────────────────────
@@ -32,9 +32,20 @@ class Settings(BaseSettings):
     pinecone_metric: str = "cosine"
 
     # ── Data ─────────────────────────────────────────────────
-    data_root: Path = Path(".")
+    # Default resolves to <workspace_root>/repos/data regardless of CWD.
+    # Override at runtime via DATA_ROOT=<path> in your .env file.
+    data_root: Path = (
+        Path(__file__).resolve().parent  # src/config/
+        .parent                          # src/
+        .parent                          # repo root
+        .parent                          # repos/
+        / "data"                         # repos/data/
+    )
     data_sources: list[str] = [
         "Banuri-ExtractedData-Output",
+        "IslamQA-ExtractedData-Output",
+        "fatwaqa-ExtractedData-Output",
+        "urdufatwa-ExtractedData-Output",
     ]
 
     # ── Chunking ─────────────────────────────────────────────

@@ -207,6 +207,60 @@ def chunk_document_as_dicts(doc: FatwaDocument) -> list[dict]:
 _SHORT_TOKEN_MIN  = 10    # below this → flagged as "too_short", discarded by default
 _LONG_TOKEN_MIN   = 500   # at or above this → flagged as "long", will be chunked
 
+# ── Source display name mapping ───────────────────────────────────────────────
+# Maps the raw folder name (from the file path) to a human-readable source
+# name used in citations, prompts, and the web UI.
+SOURCE_DISPLAY_NAMES: dict[str, str] = {
+    "Banuri-ExtractedData-Output":    "Banuri Institute (Deobandi)",
+    "IslamQA-ExtractedData-Output":   "IslamQA (Ahle Hadees)",
+    "fatwaqa-ExtractedData-Output":   "FatwaQA (Ahle Hadees)",
+    "urdufatwa-ExtractedData-Output": "UrduFatwa (Barelvi)",
+}
+
+# ── School-of-thought (maslak) mapping ───────────────────────────────────────
+# Filterable maslak tag stored as Pinecone metadata so callers can request
+# answers from a specific school of thought.
+SOURCE_MASLAK: dict[str, str] = {
+    "Banuri-ExtractedData-Output":    "Deobandi",
+    "IslamQA-ExtractedData-Output":   "Ahle Hadees",
+    "fatwaqa-ExtractedData-Output":   "Ahle Hadees",
+    "urdufatwa-ExtractedData-Output": "Barelvi",
+}
+
+
+def get_source_display_name(folder: str) -> str:
+    """Return a short display name for a data-source folder string.
+
+    Falls back to stripping the common ``-ExtractedData-Output`` suffix so
+    new sources are handled gracefully even without an explicit mapping entry.
+
+    Examples
+    --------
+    >>> get_source_display_name("Banuri-ExtractedData-Output")
+    'Banuri Institute (Deobandi)'
+    >>> get_source_display_name("SomeNewSource-ExtractedData-Output")
+    'SomeNewSource'
+    """
+    if folder in SOURCE_DISPLAY_NAMES:
+        return SOURCE_DISPLAY_NAMES[folder]
+    return folder.replace("-ExtractedData-Output", "").strip() or folder
+
+
+def get_source_maslak(folder: str) -> str:
+    """Return the school-of-thought (maslak) for a data-source folder.
+
+    Returns an empty string for unknown sources so filters composed on this
+    field still behave gracefully.
+
+    Examples
+    --------
+    >>> get_source_maslak("urdufatwa-ExtractedData-Output")
+    'Barelvi'
+    >>> get_source_maslak("fatwaqa-ExtractedData-Output")
+    'Ahle Hadees'
+    """
+    return SOURCE_MASLAK.get(folder, "")
+
 
 def _classify_length(token_count: int) -> str:
     """Return 'too_short', 'normal', or 'long'."""
@@ -261,8 +315,19 @@ def preprocess_record(
     """
     doc_id     = record.get("id", "")
     question   = record.get("question", "").strip()
+    query_text = record.get("query", "").strip()
     answer     = record.get("answer", "").strip()
-    raw_text   = record.get("text", "") or f"سوال: {question} جواب: {answer}"
+
+    # Embedding target = query/question only (no answer body).
+    # If both exist and differ, concatenate both once; otherwise keep one.
+    if query_text and question and query_text != question:
+        raw_text = f"{query_text}\n{question}"
+    else:
+        raw_text = query_text or question
+
+    if not raw_text:
+        raw_text = question
+    folder     = record.get("folder", "")
 
     # Normalise the combined text
     clean_text = normalize_urdu(raw_text, strip_diacritics=strip_diacritics)
@@ -278,11 +343,14 @@ def preprocess_record(
 
     base_meta = {
         "doc_id":        doc_id,
+        "query":         query_text,
         "question":      question,
         "answer":        answer,
         "category":      record.get("category", ""),
         "source_file":   record.get("source_file", ""),
-        "folder":        record.get("folder", ""),
+        "folder":        folder,
+        # Human-readable source name for citations and UI display
+        "source_name":   get_source_display_name(folder),
         "date":          record.get("date"),
         "reference":     record.get("reference"),
         "length_flag":   flag,

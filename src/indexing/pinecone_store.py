@@ -23,8 +23,7 @@ from pinecone import Pinecone, ServerlessSpec
 from tqdm import tqdm
 
 from src.config import get_settings
-from src.indexing.sparse import build_sparse_vector
-from src.preprocessing.chunker import Chunk
+from src.preprocessing.chunker import Chunk, get_source_display_name, get_source_maslak
 
 logger = logging.getLogger(__name__)
 
@@ -57,12 +56,17 @@ def _clamp_batch_size(requested: int) -> int:
 
 def _make_metadata(chunk: Chunk, question: str = "", answer: str = "", source_file: str = "") -> dict:
     """Build the full metadata payload stored alongside each vector."""
+    folder = chunk.source  # source field on Chunk holds the data-source folder name
     return {
         # — core fields requested —
         "question":    question or "",
         "answer":      answer   or "",
         "category":    chunk.category,
         "source_file": source_file or chunk.source,
+        # — source attribution —
+        "source_name": get_source_display_name(folder),
+        "maslak":      get_source_maslak(folder),
+        "folder":      folder,
         # — auxiliary fields for filtering / display —
         "doc_id":      chunk.doc_id,
         "source":      chunk.source,
@@ -100,7 +104,16 @@ def _make_metadata_from_dict(record_meta: dict) -> dict:
         "answer":      _clean(_trunc(record_meta.get("answer", ""))),
         "category":    _clean(record_meta.get("category", "")),
         "source_file": _clean(record_meta.get("source_file", "")),
-        # ── additional fields for filtering / display ─────────────────
+        # ── source attribution ────────────────────────────────────────
+        "source_name": _clean(
+            record_meta.get("source_name")
+            or get_source_display_name(record_meta.get("folder", ""))
+        ),        # maslak is always derived from folder — never trust a stored value
+        # because it may predate this mapping; derive fresh every upsert.
+        "maslak": _clean(
+            get_source_maslak(record_meta.get("folder", ""))
+            or record_meta.get("maslak", "")
+        ),        # ── additional fields for filtering / display ─────────────────
         "doc_id":      _clean(record_meta.get("doc_id", "")),
         "folder":      _clean(record_meta.get("folder", "")),
         "date":        _clean(record_meta.get("date", "")),
@@ -142,16 +155,17 @@ def init_index() -> Any:
         pc.create_index(
             name=settings.pinecone_index_name,
             dimension=settings.embedding_dimensions,
-            metric="cosine",
+            metric=settings.pinecone_metric,
             spec=ServerlessSpec(
                 cloud=settings.pinecone_cloud,
                 region=settings.pinecone_region,
             ),
         )
         logger.info(
-            "Created Pinecone index '%s' (dim=%d, metric=cosine)",
+            "Created Pinecone index '%s' (dim=%d, metric=%s)",
             settings.pinecone_index_name,
             settings.embedding_dimensions,
+            settings.pinecone_metric,
         )
     else:
         logger.info("Using existing Pinecone index '%s'", settings.pinecone_index_name)
@@ -310,29 +324,30 @@ def upsert_records(
     skipped = 0
     total = 0
 
-    # ── Materialise records so we can do a single bulk ID check ───────────
-    all_records = list(records)
-    total = len(all_records)
-
-    # ── Bulk duplicate prevention (one pass instead of per-batch) ─────────
-    existing_ids: set[str] = set()
-    if skip_existing and all_records:
-        all_ids = [r["id"] for r in all_records]
-        existing_ids = _fetch_existing_ids(index, all_ids)
-        if existing_ids:
-            logger.info(
-                "Skipping %d already-indexed IDs (bulk check).", len(existing_ids)
-            )
-        all_records = [r for r in all_records if r["id"] not in existing_ids]
-        skipped = total - len(all_records)
-
+    # ── Stream records in batches — never materialise the full corpus ──────
+    # Materialising all 330k × 3072-dim float32 vectors would consume ~4 GB
+    # of RAM and trigger macOS OOM kills.  Instead we do a per-batch
+    # duplicate check (Pinecone fetch accepts up to 1000 IDs per call) which
+    # keeps memory usage at O(batch_size) at all times.
     with tqdm(desc="Indexing to Pinecone", unit="vec", disable=not show_progress) as pbar:
-        for batch in _batched(all_records, effective_batch):
+        for batch in _batched(records, effective_batch):
+            total += len(batch)
+
+            # ── Per-batch duplicate prevention ────────────────────────────
+            if skip_existing:
+                batch_ids = [r["id"] for r in batch]
+                existing_in_batch = _fetch_existing_ids(index, batch_ids)
+                if existing_in_batch:
+                    skipped += len(existing_in_batch)
+                    batch = [r for r in batch if r["id"] not in existing_in_batch]
+
+            if not batch:
+                continue
+
             # ── Build Pinecone vector dicts ───────────────────────────────
             vectors = []
             for r in batch:
                 meta = r.get("metadata", {})
-                # Store the chunk text in metadata for display at query time
                 if "text" not in meta:
                     meta = {**meta}  # don't mutate caller's dict
 
@@ -340,9 +355,6 @@ def upsert_records(
                     {
                         "id":            r["id"],
                         "values":        r["embedding"],
-                        "sparse_values": build_sparse_vector(
-                            meta.get("text") or meta.get("answer") or ""
-                        ),
                         "metadata":      _make_metadata_from_dict(meta),
                     }
                 )

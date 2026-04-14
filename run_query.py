@@ -50,17 +50,25 @@ def _print_sources(sources: list[dict], n: int = 3) -> None:
     print(f"\n  ماخذ (Top {len(top)} Sources)")
     print(_SEP)
     for i, meta in enumerate(top, 1):
-        question  = (meta.get("question") or "").strip()
-        category  = meta.get("category", "نامعلوم")
-        source    = meta.get("source") or meta.get("source_file", "نامعلوم")
-        fatwa_no  = meta.get("fatwa_no", "")
+        question    = (meta.get("question") or "").strip()
+        category    = meta.get("category", "نامعلوم")
+        source_name = (
+            meta.get("source_name")
+            or (meta.get("folder", "") or meta.get("source") or meta.get("source_file", ""))
+               .replace("-ExtractedData-Output", "").strip()
+            or "نامعلوم"
+        )
+        fatwa_no    = meta.get("fatwa_no", "")
 
         # Truncate long questions for display
         if len(question) > 120:
             question = question[:120].rsplit(" ", 1)[0] + "…"
 
-        print(f"  [{i}] زمرہ    : {category}")
-        print(f"       ماخذ    : {source}")
+        maslak = meta.get("maslak", "")
+        print(f"  [{i}] ڈیٹا ماخذ : {source_name}")
+        if maslak:
+            print(f"       مسلک    : {maslak}")
+        print(f"       زمرہ    : {category}")
         if fatwa_no:
             print(f"       فتویٰ نمبر: {fatwa_no}")
         if question:

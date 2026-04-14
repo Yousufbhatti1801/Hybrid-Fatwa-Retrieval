@@ -29,6 +29,9 @@ dist/
 .bm25_cache.pkl
 embed_checkpoint.db
 .pipeline_cache/
+.pipeline_cache_*/
+pipeline_state.json
+pipeline_summary*.json
 _e2e_orch_work/
 _e2e_report.json
 _e2e_index_summary.json
@@ -37,5 +40,15 @@ _index_run_summary.json
 _ingest_banuri_summary.json
 *.log
 
+# OS
+.DS_Store
+
 # Large corpus data
 data/
+
+# PageIndex (vectorless mode) generated artifacts
+pageindex/data/fatawa_index.md
+pageindex/data/fatawa_lookup.json
+pageindex/data/subgroup_cache.json
+pageindex/index/
+pageindex/__pycache__/

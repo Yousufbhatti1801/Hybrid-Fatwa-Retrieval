@@ -4,6 +4,7 @@ const state = {
   history: [],
   isLoading: false,
   lastSources: [],
+  mode: 'hybrid',     // 'hybrid' | 'pageindex'
 };
 
 /* ── DOM refs ──────────────────────────────────────────────────────────── */
@@ -28,6 +29,15 @@ catList.addEventListener('click', e => {
   document.querySelectorAll('.cat-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   state.selectedCat = btn.dataset.cat;
+});
+
+/* ── Retrieval mode toggle (Hybrid / PageIndex) ────────────────────────── */
+document.querySelectorAll('.mode-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.mode = btn.dataset.mode || 'hybrid';
+  });
 });
 
 /* ── Suggestion chips ──────────────────────────────────────────────────── */
@@ -90,32 +100,76 @@ async function sendQuestion() {
   questionInput.value = '';
   questionInput.style.height = 'auto';
 
+  // Branch on retrieval mode
+  if (state.mode === 'pageindex') {
+    return doPISearch(q);
+  }
+  if (state.mode === 'raw-fatwas') {
+    return doRawFatwasSearch(q);
+  }
+
   // Show typing indicator
   const typingId = appendTyping();
   setLoading(true);
 
   try {
-    const resp = await fetch('/api/query', {
+    const payload = {
+      question:    q,
+      category:    state.selectedCat,
+      top_k:       parseInt(topKInput.value) || 5,
+      guardrails:  guardrailsToggle.checked,
+      validate:    validateToggle.checked,
+    };
+
+    // Prefer multi-school endpoint so user gets separate answers per sect.
+    let resp = await fetch('/api/query-all-schools', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question:    q,
-        category:    state.selectedCat,
-        top_k:       parseInt(topKInput.value) || 5,
-        guardrails:  guardrailsToggle.checked,
-        validate:    validateToggle.checked,
-      }),
+      body: JSON.stringify(payload),
     });
 
     removeTyping(typingId);
 
-    if (!resp.ok) {
+    if (resp.ok) {
+      const data = await resp.json();
+      const results = Array.isArray(data.results) ? data.results : [];
+
+      if (results.length) {
+        // One clearly-labeled answer card per sect
+        results.forEach(r => {
+          appendBotBubble({
+            answer: r.answer,
+            sources: r.sources || [],
+            blocked: false,
+            guard_hits: [],
+            num_chunks: r.num_chunks,
+            elapsed_ms: r.elapsed_ms,
+            validation: null,
+            dry_run: data.dry_run,
+            maslak: r.maslak,
+          });
+        });
+        addHistory(q);
+      } else {
+        // Fallback to original single-answer endpoint
+        resp = await fetch('/api/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ error: resp.statusText }));
+          appendErrorBubble(err.error || 'Server error');
+        } else {
+          const single = await resp.json();
+          appendBotBubble(single);
+          addHistory(q);
+        }
+      }
+    } else {
       const err = await resp.json().catch(() => ({ error: resp.statusText }));
       appendErrorBubble(err.error || 'Server error');
-    } else {
-      const data = await resp.json();
-      appendBotBubble(data);
-      addHistory(q);
     }
   } catch (err) {
     removeTyping(typingId);
@@ -163,12 +217,22 @@ function appendBotBubble(data) {
   el.className = 'msg msg-bot';
 
   const badge     = buildStatusBadge(data);
+  const sectBadge = data.maslak ? `<span class="badge badge-ok">${escHtml(data.maslak)}</span>` : '';
   const guardHtml = buildGuardHits(data.guard_hits || []);
   const valHtml   = buildValBar(data.validation);
   const footHtml  = buildFooter(data);
+  const sectLine  = data.maslak ? `<p class="answer-text"><strong>مسلک:</strong> ${escHtml(data.maslak)}</p>` : '';
+  // If the preprocessor translated a non-Urdu query, show how it was interpreted.
+  const showInterp =
+    data.original_question &&
+    data.urdu_question &&
+    data.original_question.trim() !== data.urdu_question.trim();
+  const interpLine = showInterp
+    ? `<p class="answer-interp"><em>تلاش بطور:</em> ${escHtml(data.urdu_question)}</p>`
+    : '';
   const bodyHtml  = data.blocked
     ? `<p class="blocked-msg">⚠ ${escHtml(data.answer)}</p>`
-    : `<p class="answer-text">${escHtml(data.answer)}</p>`;
+    : `${sectLine}${interpLine}<p class="answer-text">${escHtml(data.answer)}</p>`;
 
   el.innerHTML = `
     <div class="card">
@@ -178,6 +242,7 @@ function appendBotBubble(data) {
           <span class="card-label">جواب (Answer)</span>
         </div>
         <div class="card-meta">
+          ${sectBadge}
           ${badge}
           ${data.dry_run ? '<span class="badge badge-dry">dry-run</span>' : ''}
         </div>
@@ -273,15 +338,20 @@ function buildFooter(data) {
 }
 
 function buildSourceCard(src, rank) {
+  const ref = src.reference || src.url || '';
+  const refHtml = ref
+    ? `<p class="src-file"><a href="${escHtml(ref)}" target="_blank" rel="noopener noreferrer">🔗 Open fatwa source</a></p>`
+    : '';
   return `
     <div class="src-card">
       <div class="src-header">
         <span class="src-rank">${rank}</span>
-        <span class="src-cat">${escHtml(src.category || '—')}</span>
+        <span class="src-cat">${escHtml(src.maslak || src.source_name || src.category || '—')}</span>
         <span class="src-score">score: ${src.score ?? '—'}</span>
       </div>
       <p class="src-q">${escHtml(src.question || '—')}</p>
       <p class="src-file">${escHtml(src.source_file || src.fatwa_no || '')}</p>
+      ${refHtml}
     </div>`;
 }
 
@@ -333,4 +403,235 @@ function escHtml(str) {
 function trimWords(str, n) {
   const words = str.split(/\s+/);
   return words.length <= n ? str : words.slice(0, n).join(' ') + '…';
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   PageIndex (vectorless) mode
+   ──────────────────────────────────────────────────────────────────────── */
+
+const SCHOOL_DISPLAY = {
+  Banuri:    { en: 'Banuri',    maslak: 'Deobandi',    maslakUr: 'دیوبندی' },
+  fatwaqa:   { en: 'FatwaQA',   maslak: 'Ahle Hadees', maslakUr: 'اہل حدیث' },
+  IslamQA:   { en: 'IslamQA',   maslak: 'Ahle Hadees', maslakUr: 'اہل حدیث' },
+  urdufatwa: { en: 'UrduFatwa', maslak: 'Barelvi',     maslakUr: 'بریلوی' },
+};
+
+async function doPISearch(q) {
+  const typingId = appendTyping();
+  setLoading(true);
+
+  try {
+    const resp = await fetch('/api/search_pageindex', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ question: q }),
+    });
+    removeTyping(typingId);
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: resp.statusText }));
+      appendErrorBubble(err.error || 'PageIndex error');
+      return;
+    }
+    const data = await resp.json();
+    renderPIResults(data);
+    addHistory(q);
+  } catch (err) {
+    removeTyping(typingId);
+    appendErrorBubble('شبکہ خطا — Network error: ' + err.message);
+  } finally {
+    setLoading(false);
+    scrollBottom();
+  }
+}
+
+function renderPIResults(data) {
+  const results = Array.isArray(data.results) ? data.results : [];
+
+  // Build one full-width section per school (stacked vertically)
+  const sections = results.map(r => _piSchoolSection(r)).join('');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-bot';
+  wrap.innerHTML = `
+    <div class="pi-results">
+      <div class="pi-results-header">
+        <span class="pi-results-icon">🌳</span>
+        <span class="pi-results-title">PageIndex — چار مسالک</span>
+        <span class="pi-results-stats">
+          ⏱ ${data.elapsed_ms ?? '?'} ms
+          ${data.dry_run ? ' · dry-run' : ''}
+        </span>
+      </div>
+      ${sections}
+    </div>`;
+
+  // Wire خلاصہ buttons
+  wrap.querySelectorAll('.pi-summarise-btn').forEach(btn => {
+    btn.addEventListener('click', () => onSummariseClick(btn));
+  });
+
+  messages.appendChild(wrap);
+}
+
+/* ── Relevance badge (rank-based: #1=95%, #2=80%, #3=65%, #4=50%) ─── */
+function _relTier(pct) {
+  const n = Number(pct || 0);
+  if (n >= 90) return { cls: 'pi-rel-very-high', label: 'سب سے متعلقہ' };
+  if (n >= 75) return { cls: 'pi-rel-high',      label: 'بہت متعلقہ' };
+  if (n >= 60) return { cls: 'pi-rel-mid',       label: 'متعلقہ' };
+  return                { cls: 'pi-rel-low',       label: 'ممکنہ متعلقہ' };
+}
+
+/* ── Full school section (one per madhab, stacked vertically) ──────── */
+function _piSchoolSection(r) {
+  const lbl = SCHOOL_DISPLAY[r && r.school_id] || { en: '?', maslak: '', maslakUr: '' };
+  const maslak  = r && (r.maslak || lbl.maslak) || '';
+  const initial = (lbl.en || '?').charAt(0).toUpperCase();
+
+  if (!r || !r.answer_text) {
+    return `
+      <div class="pi-section-school pi-section-school--empty" data-school="${escHtml(r ? r.school_id : '')}">
+        <div class="pi-school-bar">
+          <div class="pi-school-avatar">${escHtml(initial)}</div>
+          <div class="pi-school-info">
+            <span class="pi-school-name">${escHtml(lbl.en)}</span>
+            <span class="pi-school-maslak">${escHtml(maslak)}${lbl.maslakUr ? ' · ' + escHtml(lbl.maslakUr) : ''}</span>
+          </div>
+          <div class="pi-school-status">فتویٰ نہیں ملا</div>
+        </div>
+      </div>`;
+  }
+
+  const fatawa = Array.isArray(r.fatawa) && r.fatawa.length
+    ? r.fatawa
+    : [{ fatwa_id: r.fatwa_id, fatwa_no: r.fatwa_no, category: r.category,
+         subtopic: r.subtopic, query_text: r.query_text, question_text: r.question_text,
+         answer_text: r.answer_text, url: r.url, relevance_pct: r.relevance_pct }];
+
+  const fatwaItems = fatawa.map((f, i) => _piFatwaItem(f, i + 1, fatawa.length)).join('');
+
+  return `
+    <div class="pi-section-school" data-school="${escHtml(r.school_id)}">
+      <div class="pi-school-bar">
+        <div class="pi-school-avatar">${escHtml(initial)}</div>
+        <div class="pi-school-info">
+          <span class="pi-school-name">${escHtml(lbl.en)}</span>
+          <span class="pi-school-maslak">${escHtml(maslak)}${lbl.maslakUr ? ' · ' + escHtml(lbl.maslakUr) : ''}</span>
+        </div>
+        <div class="pi-school-count">${fatawa.length} fatawa</div>
+      </div>
+      <div class="pi-fatwa-list">
+        ${fatwaItems}
+      </div>
+    </div>`;
+}
+
+function _piFatwaItem(f, rank, total) {
+  const pct = Number(f.relevance_pct || 0);
+  const tier = _relTier(pct);
+  const fid = escHtml(f.fatwa_id || '');
+  const isFirst = rank === 1;
+
+  const urlHtml = f.url
+    ? `<a class="pi-fatwa-url" href="${escHtml(f.url)}" target="_blank" rel="noopener noreferrer">
+         🔗 ${escHtml(f.url.length > 80 ? f.url.substring(0, 80) + '…' : f.url)}
+       </a>`
+    : '<span class="pi-fatwa-url pi-fatwa-url--none">URL not available</span>';
+
+  return `
+    <div class="pi-fatwa-item ${isFirst ? 'pi-fatwa-item--primary' : ''}" data-rank="${rank}">
+      <div class="pi-fatwa-header">
+        <span class="pi-fatwa-rank">${rank}</span>
+        <span class="pi-rel-badge ${tier.cls}">${pct}% ${escHtml(tier.label)}</span>
+        <span class="pi-fatwa-crumb">
+          ${f.category ? escHtml(f.category) : ''}${f.subtopic ? ' › ' + escHtml(f.subtopic) : ''}
+        </span>
+      </div>
+
+      <div class="pi-fatwa-title">${escHtml(f.query_text || f.fatwa_no || '—')}</div>
+
+      <div class="pi-fatwa-q">
+        <span class="pi-fatwa-qlabel">سوال:</span>
+        ${escHtml(f.question_text || '—')}
+      </div>
+
+      <div class="pi-fatwa-a ${isFirst ? '' : 'pi-fatwa-a--collapsed'}">
+        <span class="pi-fatwa-alabel">جواب:</span>
+        ${escHtml(f.answer_text || '')}
+      </div>
+      ${!isFirst ? '<button class="pi-expand-btn" onclick="this.previousElementSibling.classList.toggle(\'pi-fatwa-a--collapsed\'); this.textContent = this.previousElementSibling.classList.contains(\'pi-fatwa-a--collapsed\') ? \'مکمل جواب دکھائیں ▼\' : \'جواب چھپائیں ▲\'">مکمل جواب دکھائیں ▼</button>' : ''}
+
+      <div class="pi-fatwa-footer">
+        ${urlHtml}
+        <button class="pi-summarise-btn" data-fatwa-id="${fid}">✨ خلاصہ</button>
+      </div>
+    </div>`;
+}
+
+async function onSummariseClick(btn) {
+  const fatwaId = btn.dataset.fatwaId;
+  if (!fatwaId) return;
+  btn.disabled = true;
+  btn.textContent = 'لوڈ ہو رہا…';
+  try {
+    const resp = await fetch('/api/summarise', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ fatwa_id: fatwaId }),
+    });
+    if (!resp.ok) {
+      btn.textContent = 'خرابی';
+      return;
+    }
+    const data = await resp.json();
+    const item = btn.closest('.pi-fatwa-item') || btn.closest('.pi-section-school');
+    if (!item) return;
+    const block = document.createElement('div');
+    block.className = 'pi-summary-block';
+    block.textContent = data.summary || '(خلاصہ دستیاب نہیں)';
+    const existing = item.querySelector('.pi-summary-block');
+    if (existing) existing.remove();
+    const answerEl = item.querySelector('.pi-fatwa-a') || item.querySelector('.pi-answer');
+    if (answerEl) answerEl.after(block);
+    btn.textContent = '✓ خلاصہ';
+  } catch (err) {
+    btn.textContent = 'خرابی';
+    btn.disabled = false;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   Raw Fatwas mode — inverted index, no LLM, sub-second
+   ──────────────────────────────────────────────────────────────────────── */
+
+async function doRawFatwasSearch(q) {
+  const typingId = appendTyping();
+  setLoading(true);
+
+  try {
+    const resp = await fetch('/api/search_raw_fatwas', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ question: q }),
+    });
+    removeTyping(typingId);
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: resp.statusText }));
+      appendErrorBubble(err.error || 'Raw fatwas error');
+      return;
+    }
+    const data = await resp.json();
+    // Reuse the same stacked-sections renderer as PageIndex —
+    // the JSON shape is identical.
+    renderPIResults(data);
+    addHistory(q);
+  } catch (err) {
+    removeTyping(typingId);
+    appendErrorBubble('شبکہ خطا — Network error: ' + err.message);
+  } finally {
+    setLoading(false);
+    scrollBottom();
+  }
 }

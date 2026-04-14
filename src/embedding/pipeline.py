@@ -240,7 +240,13 @@ def embed_chunks(
     batch_size: int | None = None,
     overwrite: bool = False,
     show_progress: bool = True,
+    skip_replay: bool = False,
 ) -> Generator[dict, None, None]:
+    """When *skip_replay* is True, pre-existing checkpoint records are NOT
+    replayed into memory — they are only used to populate the skip-ID set.
+    Stage 6 reads from the checkpoint DB directly so replay is unnecessary
+    and wastes large amounts of RAM for big corpora.
+    """
     """Embed preprocessed chunks with resumable checkpointing.
 
     Parameters
@@ -285,10 +291,17 @@ def embed_chunks(
         # ── Step 1: replay already-computed embeddings ────────────────────
         pre_existing = ckpt.count()
         if pre_existing:
-            logger.info(
-                "Replaying %d pre-existing embeddings from checkpoint.", pre_existing
-            )
-            yield from ckpt.iter_all()
+            if skip_replay:
+                logger.info(
+                    "Skipping replay of %d pre-existing embeddings (skip_replay=True)."
+                    "  Stage 6 will read them directly from the checkpoint DB.",
+                    pre_existing,
+                )
+            else:
+                logger.info(
+                    "Replaying %d pre-existing embeddings from checkpoint.", pre_existing
+                )
+                yield from ckpt.iter_all()
 
         # ── Step 2: collect IDs to skip ───────────────────────────────────
         skip_ids: set[str] = ckpt.get_existing_ids()

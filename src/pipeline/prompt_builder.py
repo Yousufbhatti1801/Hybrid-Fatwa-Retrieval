@@ -80,6 +80,8 @@ _FATWA_BLOCK = """\
 ┌─────────────────────────────────────────┐
 │  فتویٰ {index}                              │
 └─────────────────────────────────────────┘
+ڈیٹا ماخذ  : {source_name}
+مسلک      : {maslak}
 ماخذ      : {source}
 زمرہ      : {category}
 فتویٰ نمبر : {fatwa_no}
@@ -149,15 +151,19 @@ def format_context(results: list[dict]) -> str:
             # Flat dict — the keys live directly on `r`
             meta = r
 
-        source   = meta.get("source") or meta.get("source_file") or "نامعلوم"
-        category = meta.get("category") or "نامعلوم"
-        fatwa_no = meta.get("fatwa_no") or meta.get("doc_id") or "نامعلوم"
-        question = (meta.get("question") or "").strip() or "—"
-        text     = (r.get("text") or meta.get("text") or meta.get("answer") or "").strip()
+        source      = meta.get("source") or meta.get("source_file") or "نامعلوم"
+        source_name = meta.get("source_name") or source.replace("-ExtractedData-Output", "").strip() or source
+        maslak      = meta.get("maslak") or "نامعلوم"
+        category    = meta.get("category") or "نامعلوم"
+        fatwa_no    = meta.get("fatwa_no") or meta.get("doc_id") or "نامعلوم"
+        question    = (meta.get("question") or "").strip() or "—"
+        text        = (meta.get("answer") or r.get("text") or meta.get("text") or "").strip()
 
         blocks.append(
             _FATWA_BLOCK.format(
                 index=i,
+                source_name=source_name,
+                maslak=maslak,
                 source=source,
                 category=category,
                 fatwa_no=fatwa_no,

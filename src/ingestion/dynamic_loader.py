@@ -10,6 +10,7 @@ Every record yielded by this module follows this shape::
 
     {
         "id":          str,      # SHA-256 stable ID (16-char hex)
+        "query":       str,      # raw query-like column if present, else ""
         "question":    str,      # mapped question column, or ""
         "answer":      str,      # mapped answer column, or ""
         "text":        str,      # "سوال: {question} جواب: {answer}"
@@ -97,6 +98,27 @@ def _get_value(row, col: str | None) -> str:
         return ""
 
 
+def _get_query_value(row) -> str:
+    """Best-effort extraction of a query-like field from raw row columns.
+
+    This is independent of role-mapping so files with both `query` and
+    `question` columns can preserve both values in the unified record.
+    """
+    query_aliases = {
+        "query", "queries", "question", "questions",
+        "sawal", "sawaal", "سوال",
+    }
+    try:
+        for col in row.index:
+            if str(col).strip().lower() in query_aliases:
+                val = str(row[col]).strip()
+                if val and val not in ("nan", "None"):
+                    return val
+    except Exception:
+        return ""
+    return ""
+
+
 def _build_record(
     row,
     mapping: dict[str, str | None],
@@ -110,6 +132,7 @@ def _build_record(
     Returns None for empty rows (both question and answer are blank).
     """
     question  = _get_value(row, mapping.get("question"))
+    query     = _get_query_value(row)
     answer    = _get_value(row, mapping.get("answer"))
 
     # Skip rows that carry no usable text
@@ -134,6 +157,7 @@ def _build_record(
 
     return {
         "id":          rec_id,
+        "query":       query,
         "question":    question,
         "answer":      answer,
         "text":        f"سوال: {question} جواب: {answer}",

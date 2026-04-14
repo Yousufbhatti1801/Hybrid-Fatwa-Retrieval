@@ -39,18 +39,76 @@ logger = logging.getLogger(__name__)
 _CANDIDATE_MULTIPLIER = 3
 _MIN_CANDIDATES = 30   # never fetch fewer than this, even for very small top-k
 
+import re as _re_dedupe
+# Strip whitespace, zero-width chars, Arabic diacritics, and punctuation
+# so minor formatting differences don't prevent dedup.
+_DEDUPE_STRIP = _re_dedupe.compile(
+    r"[\s\u200c\u200d\u200e\u200f\u061c\u064b-\u065f،۔؟\?;,!\.\(\)\[\]'\"]+"
+)
+
+
+def _content_key(meta: dict) -> str:
+    """Aggressive content-based dedupe key.
+
+    The same fatwa can exist under multiple composite IDs (e.g., when
+    urdufatwa cross-lists the same fatwa under معاملات + وراثت +
+    مالی معاملات). We fingerprint the first 120 chars of the question
+    with all whitespace/punctuation/diacritics stripped, so even
+    fatwas with minor formatting differences collapse to one key.
+    """
+    q = (meta.get("question") or meta.get("question_text") or "").strip()
+    q = q[:120]
+    return _DEDUPE_STRIP.sub("", q).lower()
+
+
+def _dedupe_by_content(
+    fused: list[tuple[str, float, dict]],
+) -> list[tuple[str, float, dict]]:
+    """Drop lower-scoring duplicates from a pre-sorted fused result list.
+
+    Preserves order (so the highest-scoring copy of each unique fatwa
+    is retained). Empty content keys are always kept (can't dedupe without
+    content).
+    """
+    seen: set[str] = set()
+    out: list[tuple[str, float, dict]] = []
+    for cid, score, meta in fused:
+        key = _content_key(meta)
+        if not key:
+            out.append((cid, score, meta))
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((cid, score, meta))
+    return out
+
+
 # ── Cached BM25 corpus (loaded once, reused for all queries) ─────────────────
+import threading as _threading
 _BM25_CACHE: "BM25Corpus | None" = None
+_BM25_LOCK = _threading.Lock()
 
 
 def _get_bm25_corpus() -> "BM25Corpus | None":
     """Return a cached BM25Corpus, loading from disk (or building) on first call.
 
-    Returns *None* if the corpus is not yet available (e.g. still building
-    in a background thread) — callers must handle this gracefully.
+    Thread-safe: if multiple threads call this concurrently while the
+    corpus is loading, only ONE will trigger the load; others block on
+    the lock and reuse the result. Previously, a race condition caused
+    duplicate 150-second loads.
+
+    Returns *None* if the corpus can't be loaded.
     """
     global _BM25_CACHE
-    if _BM25_CACHE is None:
+    # Fast path: already loaded, no lock needed
+    if _BM25_CACHE is not None:
+        return _BM25_CACHE
+
+    # Slow path: acquire lock, check again, load if needed
+    with _BM25_LOCK:
+        if _BM25_CACHE is not None:
+            return _BM25_CACHE
         try:
             from src.retrieval.bm25_index import BM25Corpus  # lazy import
             _BM25_CACHE = BM25Corpus.load_or_build()
@@ -93,6 +151,7 @@ def _dense_search(
     query_vec: list[float],
     candidates: int,
     category: str | None = None,
+    maslak: str | None = None,
 ) -> dict[str, tuple[float, dict]]:
     """Query Pinecone with a pure dense vector.
 
@@ -101,32 +160,64 @@ def _dense_search(
     category:
         When provided, adds a Pinecone metadata filter so only vectors whose
         ``category`` field equals this value are returned.
+    maslak:
+        When provided, restricts results to a specific school of thought
+        (e.g. ``"Deobandi"``, ``"Barelvi"``, ``"Ahle Hadees"``, ``"Salafi"``).
 
     Returns {chunk_id: (raw_score, metadata_dict)}.
     """
+    import time as _t
+    _t0 = _t.perf_counter()
     index = init_index()
     kwargs: dict = {
         "vector": query_vec,
         "top_k": candidates,
         "include_metadata": True,
     }
+    filters: list[dict] = []
     if category:
-        kwargs["filter"] = {"category": {"$eq": category}}
+        filters.append({"category": {"$eq": category}})
+    if maslak:
+        filters.append({"maslak": {"$eq": maslak}})
+    if len(filters) == 1:
+        kwargs["filter"] = filters[0]
+    elif len(filters) > 1:
+        kwargs["filter"] = {"$and": filters}
 
     response = index.query(**kwargs)
-    return {
+    result = {
         match.id: (match.score, dict(match.metadata or {}))
         for match in response.matches
     }
+    logger.info("[_dense_search] pinecone query=%.0fms matches=%d",
+                (_t.perf_counter() - _t0) * 1000, len(result))
+    return result
 
 
 # ── Sparse retrieval (BM25) ───────────────────────────────────────────────────
+
+def _sparse_search_timed(
+    query: str,
+    candidates: int,
+    corpus: "BM25Corpus",
+    category: str | None = None,
+    maslak: str | None = None,
+) -> dict[str, tuple[float, dict]]:
+    """Timing wrapper for _sparse_search."""
+    import time as _t
+    _t0 = _t.perf_counter()
+    result = _sparse_search(query, candidates, corpus, category, maslak)
+    logger.info("[_sparse_search] bm25=%.0fms matches=%d",
+                (_t.perf_counter() - _t0) * 1000, len(result))
+    return result
+
 
 def _sparse_search(
     query: str,
     candidates: int,
     corpus: "BM25Corpus",
     category: str | None = None,
+    maslak: str | None = None,
 ) -> dict[str, tuple[float, dict]]:
     """Query the BM25 corpus.
 
@@ -134,6 +225,9 @@ def _sparse_search(
     ----------
     category:
         When provided, BM25 hits whose ``category`` metadata field does not
+        match are dropped before returning.
+    maslak:
+        When provided, BM25 hits whose ``maslak`` metadata field does not
         match are dropped before returning.
 
     Returns {doc_id: (raw_bm25_score, metadata_dict)}.
@@ -150,6 +244,12 @@ def _sparse_search(
             for cid, (score, meta) in results.items()
             if meta.get("category", "") == category
         }
+    if maslak:
+        results = {
+            cid: (score, meta)
+            for cid, (score, meta) in results.items()
+            if meta.get("maslak", "") == maslak
+        }
     return results
 
 
@@ -163,6 +263,7 @@ def hybrid_search(
     bm25_corpus: "BM25Corpus | None" = None,
     *,
     category: str | None = None,
+    maslak: str | None = None,
     question_boost: float = 0.15,
 ) -> list[dict]:
     """Run a hybrid query and return ranked results.
@@ -185,6 +286,10 @@ def hybrid_search(
         filter both the Pinecone dense path (metadata filter) and the BM25
         sparse path (post-filter on the ``category`` field).  When *None*,
         no filtering is applied and all categories are searched.
+    maslak:
+        Optional school-of-thought filter: ``"Deobandi"``, ``"Barelvi"``,
+        ``"Ahle Hadees"``, or ``"Salafi"``.  Restricts both Pinecone and BM25
+        results to the chosen school.  When *None*, all schools are searched.
     question_boost:
         Additive weight (default ``0.15``) applied to a third BM25 score
         computed over the **question field only**.  This rewards results
@@ -216,41 +321,60 @@ def hybrid_search(
     sw = sparse_weight if sparse_weight is not None else settings.sparse_weight
     candidates = max(_MIN_CANDIDATES, top_k * _CANDIDATE_MULTIPLIER)
 
+    import time as _t
+    _t0 = _t.perf_counter()
+
     # Normalise query once, reuse for both paths
     normalised = normalize_urdu(query)
+    _t_norm = (_t.perf_counter() - _t0) * 1000
 
     # ── 1. Build / load BM25 corpus ───────────────────────────────────────────
+    _t0 = _t.perf_counter()
     if bm25_corpus is None:
         bm25_corpus = _get_bm25_corpus()  # may be None if not ready
+    _t_bm25load = (_t.perf_counter() - _t0) * 1000
 
     # ── 2. Embed query ──────────────────────────────────────────────────────
+    _t0 = _t.perf_counter()
     query_vec = embed_single(normalised)
+    _t_embed = (_t.perf_counter() - _t0) * 1000
 
-    # ── 3. Dense + Sparse paths (run in parallel if BM25 available) ────────
+    # ── 3. Dense + Sparse + Question-boost paths (all in parallel) ──────────
+    _t0 = _t.perf_counter()
     if bm25_corpus is not None:
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             dense_future: Future = pool.submit(
-                _dense_search, query_vec, candidates, category,
+                _dense_search, query_vec, candidates, category, maslak,
             )
             sparse_future: Future = pool.submit(
-                _sparse_search, normalised, candidates, bm25_corpus, category,
+                _sparse_search_timed, normalised, candidates, bm25_corpus, category, maslak,
             )
+            # Question-boost BM25 runs in parallel too (was sequential)
+            qboost_future: Future | None = None
+            if question_boost > 0:
+                qboost_future = pool.submit(
+                    bm25_corpus.score_questions, normalised, candidates,
+                )
+
             dense_hits = dense_future.result()
             sparse_hits = sparse_future.result()
+            raw_q_scores = qboost_future.result() if qboost_future else {}
     else:
-        # BM25 not available — dense only
         logger.info("BM25 not loaded yet; using dense-only retrieval")
-        dense_hits = _dense_search(query_vec, candidates, category)
+        dense_hits = _dense_search(query_vec, candidates, category, maslak)
         sparse_hits = {}
+        raw_q_scores = {}
+    _t_search = (_t.perf_counter() - _t0) * 1000
 
-    # ── 4. Question-field boost ────────────────────────────────────────────────
-    # Score each candidate against the question field only; used as an additive
-    # bonus so fatwas whose saved question is semantically close to the user
-    # query rank higher than those that only match in the answer body.
-    if question_boost > 0 and bm25_corpus is not None:
-        raw_q_scores = bm25_corpus.score_questions(normalised, candidates)
-        # Only boost IDs already present in dense or sparse results;
-        # norm_q is a re-ranking signal, not a source of new candidates.
+    logger.info(
+        "[hybrid_search] norm=%.0fms bm25load=%.0fms embed=%.0fms search=%.0fms "
+        "dense=%d sparse=%d qboost=%d",
+        _t_norm, _t_bm25load, _t_embed, _t_search,
+        len(dense_hits), len(sparse_hits), len(raw_q_scores),
+    )
+
+    # ── 4. Question-field boost (post-filter: only boost existing candidates) ─
+    if raw_q_scores:
         allowed = set(dense_hits) | set(sparse_hits)
         raw_q_scores = {k: v for k, v in raw_q_scores.items() if k in allowed}
         norm_q = _minmax_normalize(raw_q_scores)
@@ -280,8 +404,14 @@ def hybrid_search(
 
         fused.append((cid, final, meta))
 
-    # ── 7. Sort and truncate ──────────────────────────────────────────────────
+    # ── 7. Sort, deduplicate by content, then truncate ──────────────────────
+    # The same fatwa can be ingested into multiple CSVs (e.g., urdufatwa's
+    # cross-referencing across subtopics like معاملات/وراثت/مالی معاملات).
+    # Different composite IDs → hybrid fusion treats them as distinct results.
+    # Here we deduplicate by content hash (question+answer), keeping only
+    # the highest-scoring copy.
     fused.sort(key=lambda x: x[1], reverse=True)
+    fused = _dedupe_by_content(fused)
     top = fused[:top_k]
 
     results = [
@@ -310,6 +440,7 @@ def hybrid_search_as_chunks(
     bm25_corpus: "BM25Corpus | None" = None,
     *,
     category: str | None = None,
+    maslak: str | None = None,
     question_boost: float = 0.15,
 ) -> list[RetrievedChunk]:
     """Same as ``hybrid_search`` but returns ``RetrievedChunk`` dataclass objects.
@@ -318,7 +449,7 @@ def hybrid_search_as_chunks(
     """
     raw = hybrid_search(
         query, top_k, dense_weight, sparse_weight, bm25_corpus,
-        category=category, question_boost=question_boost,
+        category=category, maslak=maslak, question_boost=question_boost,
     )
     return [
         RetrievedChunk(

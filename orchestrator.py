@@ -450,31 +450,38 @@ def run_stage_5(
     try:
         from src.embedding.pipeline import embed_chunks  # noqa: PLC0415
 
-        records: list[dict] = list(
-            embed_chunks(
-                chunk_gen,
-                checkpoint_path=checkpoint_path,
-                batch_size=batch_size,
-                show_progress=True,
-            )
-        )
+        # skip_replay=True: pre-existing checkpoint records are NOT loaded
+        # into RAM — Stage 6 reads them directly from the SQLite DB.
+        # Count by iterating (O(1) memory) rather than list() (O(N) memory).
+        total_embedded = 0
+        for _ in embed_chunks(
+            chunk_gen,
+            checkpoint_path=checkpoint_path,
+            batch_size=batch_size,
+            show_progress=True,
+            skip_replay=True,
+        ):
+            total_embedded += 1
+        # Add back the pre-existing count so the summary reflects reality
+        from src.embedding.pipeline import EmbeddingCheckpoint  # noqa: PLC0415
+        with EmbeddingCheckpoint(checkpoint_path) as _ckpt:
+            total_embedded = _ckpt.count()
         result.mark_completed(
             t0,
             {
-                "total_embedded": len(records),
+                "total_embedded": total_embedded,
                 "checkpoint": str(checkpoint_path),
             },
         )
         logger.info(
-            "[Stage 5] Done — %d vectors ready in %.1fs.", len(records), result.elapsed_s
+            "[Stage 5] Done — %d vectors ready in %.1fs.", total_embedded, result.elapsed_s
         )
     except Exception as exc:
         result.mark_failed(exc)
-        records = []
 
     if state:
         state.record(result)
-    return result, records
+    return result, None
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +527,7 @@ def run_stage_6(
         upsert_summary = upsert_records(
             load_checkpoint(checkpoint_path),
             batch_size=batch_size,
-            skip_existing=True,
+            skip_existing=False,
             show_progress=True,
         )
         result.mark_completed(t0, upsert_summary)
@@ -542,8 +549,13 @@ def run_stage_6(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+# Default data root: sibling ``data/`` folder next to this repo, independent
+# of the current working directory.
+_DATA_ROOT_DEFAULT = Path(__file__).resolve().parent.parent / "data"
+
+
 def orchestrate(
-    data_root: Path = Path("data"),
+    data_root: Path = _DATA_ROOT_DEFAULT,
     work_dir: Path = Path(".pipeline_cache"),
     batch_size: int = 100,
     requested_stages: set[int] | None = None,
@@ -768,8 +780,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  python orchestrator.py --stages 1,2 --force   # refresh schema cache\n"
         ),
     )
-    p.add_argument("--data-root",  type=Path, default=Path("data"),
-                   metavar="PATH", help="Fatawa CSV root directory  [default: data]")
+    p.add_argument("--data-root",  type=Path, default=_DATA_ROOT_DEFAULT,
+                   metavar="PATH", help="Fatawa CSV root directory  [default: ../data (sibling of repo)]")
     p.add_argument("--work-dir",   type=Path, default=Path(".pipeline_cache"),
                    metavar="PATH", help="Intermediate file cache     [default: .pipeline_cache]")
     p.add_argument("--batch-size", type=int,  default=100,

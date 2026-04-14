@@ -123,8 +123,12 @@ def load_csv_as_dicts(path: Path) -> list[dict]:
             "answer":      str,
             "category":    str,   # parent folder (e.g. "NAMAZ")
             "source_file": str,   # CSV filename
+            "folder":      str,   # data-source folder (e.g. "Banuri-ExtractedData-Output")
+            "source_name": str,   # human-readable source (e.g. "Banuri Institute")
         }
     """
+    from src.preprocessing.chunker import get_source_display_name  # lazy import
+
     parts = path.parts
     source = parts[-3]
     category = parts[-2]
@@ -153,6 +157,8 @@ def load_csv_as_dicts(path: Path) -> list[dict]:
                 "answer": answer,
                 "category": category,
                 "source_file": path.name,
+                "folder": source,
+                "source_name": get_source_display_name(source),
             }
         )
 

@@ -13,6 +13,11 @@ rank-bm25>=0.2.2
 # Utilities
 tqdm>=4.66.0
 
+# Note: the VectifyAI/PageIndex md-to-tree parser is vendored locally in
+# pageindex/_md_parser.py (~120 LOC, MIT license) because the upstream
+# repo has no setup.py/pyproject.toml and the PyPI `pageindex` package
+# is a different (hosted-API) client. No extra dependencies needed.
+
 # Dev / testing (optional)
 pytest>=8.0.0
 ipython>=8.0.0

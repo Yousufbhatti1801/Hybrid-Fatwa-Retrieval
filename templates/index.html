@@ -51,6 +51,23 @@
       <!-- Settings -->
       <div class="sidebar-section settings-section">
         <h3 class="sidebar-label">ترتیبات — Settings</h3>
+
+        <!-- Retrieval mode toggle: Hybrid (Pinecone+BM25) vs PageIndex (vectorless tree nav) -->
+        <div class="mode-toggle" id="modeToggle">
+          <button class="mode-btn active" data-mode="hybrid" type="button">
+            <span class="mode-icon">⚡</span>
+            <span class="mode-label">Hybrid</span>
+          </button>
+          <button class="mode-btn" data-mode="pageindex" type="button">
+            <span class="mode-icon">🌳</span>
+            <span class="mode-label">PageIndex</span>
+          </button>
+          <button class="mode-btn" data-mode="raw-fatwas" type="button">
+            <span class="mode-icon">📄</span>
+            <span class="mode-label">Raw</span>
+          </button>
+        </div>
+
         <label class="toggle-row">
           <span>Guardrails</span>
           <input type="checkbox" id="guardrailsToggle" {% if guardrails_on %}checked{% endif %} />
@@ -93,9 +110,9 @@
           <button class="chip" data-q="نماز قصر کے احکام کیا ہیں؟">نماز قصر</button>
           <button class="chip" data-q="زکوٰۃ کا نصاب کیا ہے؟">زکوٰۃ نصاب</button>
           <button class="chip" data-q="وضو کن چیزوں سے ٹوٹتا ہے؟">ناقضِ وضو</button>
-          <button class="chip" data-q="روزے کی حالت میں کیا چیزیں روزہ توڑتی ہیں؟">روزہ</button>
-          <button class="chip" data-q="حج فرض ہونے کی کیا شرائط ہیں؟">فرضیتِ حج</button>
-          <button class="chip" data-q="نکاح کی شرائط کیا ہیں؟">نکاح</button>
+          <button class="chip" data-q="how to do wudu properly">EN: how to do wudu</button>
+          <button class="chip" data-q="namaz ka qasar kab hota hai">RU: namaz ka qasar</button>
+          <button class="chip" data-q="when can I shorten prayers while travelling">EN: travel prayer</button>
         </div>
       </div>
 
@@ -108,9 +125,9 @@
           <textarea
             id="questionInput"
             class="question-input"
-            placeholder="اپنا سوال یہاں لکھیں…"
+            placeholder="اردو، English, یا Roman Urdu میں سوال لکھیں…"
             rows="1"
-            dir="rtl"
+            dir="auto"
           ></textarea>
           <button class="send-btn" id="sendBtn" title="سوال بھیجیں">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

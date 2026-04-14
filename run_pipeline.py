@@ -83,6 +83,9 @@ import time
 from pathlib import Path
 from typing import Generator
 
+# Default data root: sibling ``data/`` folder next to this repo.
+_DATA_ROOT_DEFAULT = Path(__file__).resolve().parent.parent / "data"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -316,11 +319,11 @@ def stage_6_pinecone_indexing(
 
 
 def run_index(
-    data_root: Path,
-    checkpoint_path: Path,
-    batch_size: int,
-    stages: set[int],
-    dry_run: bool,
+    data_root: Path = _DATA_ROOT_DEFAULT,
+    checkpoint_path: Path = Path("embed_checkpoint.db"),
+    batch_size: int = 100,
+    stages: set[int] = frozenset({1, 2, 3, 4, 5, 6}),
+    dry_run: bool = False,
 ) -> list[StageResult]:
     """Execute the requested ingest pipeline stages and return stage results."""
     t_start = time.perf_counter()
@@ -611,8 +614,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # ── Index options ────────────────────────────────────────────────────────
     idx = p.add_argument_group("Index options (--mode index / full)")
-    idx.add_argument("--data-root",   type=Path, default=Path("data"),
-                     metavar="PATH",  help="Root of fatawa CSV tree    [data]")
+    idx.add_argument("--data-root",   type=Path, default=_DATA_ROOT_DEFAULT,
+                     metavar="PATH",  help="Root of fatawa CSV tree    [../data (sibling of repo)]")
     idx.add_argument("--checkpoint",  type=Path, default=Path("embed_checkpoint.db"),
                      metavar="PATH",  help="SQLite embedding checkpoint [embed_checkpoint.db]")
     idx.add_argument("--batch-size",  type=int,  default=100,

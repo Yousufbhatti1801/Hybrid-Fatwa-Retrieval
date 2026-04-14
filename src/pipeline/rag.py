@@ -39,10 +39,13 @@ def _get_chat_client() -> OpenAI:
 def query(
     question: str,
     *,
+    retrieval_query: str | None = None,
     top_k: int | None = None,
     dense_weight: float | None = None,
     sparse_weight: float | None = None,
     context_token_budget: int | None = None,
+    category: str | None = None,
+    maslak: str | None = None,
     stream: bool = False,
 ) -> dict:
     """Run the full RAG pipeline for an Urdu fatawa query.
@@ -89,7 +92,8 @@ def query(
 
     # ── Step 1: Normalise ────────────────────────────────────────────────────
     t0 = time.perf_counter()
-    normalised = normalize_urdu(question)
+    retrieval_text = retrieval_query or question
+    normalised = normalize_urdu(retrieval_text)
     t_normalise = (time.perf_counter() - t0) * 1000
     logger.debug("Normalised query: %.80s", normalised)
 
@@ -100,6 +104,8 @@ def query(
         top_k=top_k,
         dense_weight=dense_weight,
         sparse_weight=sparse_weight,
+        category=category,
+        maslak=maslak,
     )
     t_retrieve = (time.perf_counter() - t0) * 1000
     logger.info("Retrieved %d chunks in %.0fms", len(retrieved), t_retrieve)

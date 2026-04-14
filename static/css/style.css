@@ -803,3 +803,357 @@ body {
   .welcome-state { padding: 20px; }
   .welcome-title { font-size: 1.5rem; }
 }
+
+/* ────────────────────────────────────────────────────────────────────────
+   PageIndex (vectorless) mode — sidebar toggle + 4-school result grid
+   ──────────────────────────────────────────────────────────────────────── */
+
+/* Mode toggle (sidebar) */
+.mode-toggle {
+  display: flex;
+  gap: 4px;
+  background: var(--green-800);
+  border-radius: var(--radius-md);
+  padding: 3px;
+  margin-bottom: 4px;
+}
+
+.mode-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 7px 8px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: #c0d8c8;
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 500;
+  font-family: var(--font-en);
+  transition: background .15s, color .15s, box-shadow .15s;
+}
+
+.mode-btn:hover { color: #fff; }
+
+.mode-btn.active {
+  background: linear-gradient(90deg, var(--green-500), var(--green-600));
+  color: #fff;
+  box-shadow: var(--shadow-sm);
+}
+
+.mode-icon { font-size: 0.95rem; }
+
+/* ────────────────────────────────────────────────────────────────────────
+   PageIndex — stacked school sections (full-width, one per madhab)
+   ──────────────────────────────────────────────────────────────────────── */
+
+/* Per-school accent colors */
+.pi-section-school[data-school="Banuri"]    { --pi-accent: #2563eb; --pi-accent-soft: #dbeafe; --pi-accent-deep: #1e3a8a; }
+.pi-section-school[data-school="fatwaqa"]   { --pi-accent: #d97706; --pi-accent-soft: #fef3c7; --pi-accent-deep: #854d0e; }
+.pi-section-school[data-school="IslamQA"]   { --pi-accent: #d97706; --pi-accent-soft: #fef3c7; --pi-accent-deep: #854d0e; }
+.pi-section-school[data-school="urdufatwa"] { --pi-accent: #7c3aed; --pi-accent-soft: #ede9fe; --pi-accent-deep: #5b21b6; }
+
+/* ── Results container ───────────────────────────────────────────────── */
+.pi-results {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.pi-results-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  background: var(--green-900);
+  color: #fff;
+  font-family: var(--font-en);
+  font-size: 0.82rem;
+}
+.pi-results-icon { font-size: 1.1rem; }
+.pi-results-title { font-weight: 700; flex: 1; font-family: var(--font-ur); }
+.pi-results-stats { font-size: 0.72rem; opacity: 0.75; }
+
+/* ── School section (one per madhab, stacked) ───────────────────────── */
+.pi-section-school {
+  --pi-accent: var(--green-500);
+  --pi-accent-soft: var(--green-100);
+  --pi-accent-deep: var(--green-700);
+  border-top: 1px solid var(--border);
+}
+.pi-section-school:first-child { border-top: none; }
+
+.pi-school-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  background: linear-gradient(90deg, var(--pi-accent-soft), transparent 70%);
+  border-left: 5px solid var(--pi-accent);
+}
+
+.pi-school-avatar {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--pi-accent);
+  color: #fff;
+  border-radius: 10px;
+  font-family: var(--font-en);
+  font-weight: 700;
+  font-size: 1rem;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+}
+
+.pi-school-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pi-school-name {
+  font-family: var(--font-en);
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--text-pri);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.pi-school-maslak {
+  font-family: var(--font-en);
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--pi-accent-deep);
+}
+
+.pi-school-count {
+  font-family: var(--font-en);
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--pi-accent-soft);
+  color: var(--pi-accent-deep);
+  white-space: nowrap;
+}
+
+.pi-school-status {
+  font-family: var(--font-ur);
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  direction: rtl;
+}
+
+.pi-section-school--empty .pi-school-bar {
+  background: var(--surface2);
+  border-left-color: var(--border);
+  opacity: 0.65;
+}
+
+/* ── Fatwa list (inside each school section) ─────────────────────────── */
+.pi-fatwa-list {
+  padding: 0 16px 12px;
+}
+
+.pi-fatwa-item {
+  padding: 14px 0;
+  border-bottom: 1px dashed var(--border);
+}
+.pi-fatwa-item:last-child { border-bottom: none; }
+
+.pi-fatwa-item--primary {
+  padding-bottom: 16px;
+}
+
+.pi-fatwa-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.pi-fatwa-rank {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--pi-accent);
+  color: #fff;
+  border-radius: 7px;
+  font-family: var(--font-en);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.pi-rel-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-family: var(--font-en);
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.pi-rel-very-high { background: #dcfce7; color: #14532d; }
+.pi-rel-high      { background: #fef9c3; color: #713f12; }
+.pi-rel-mid       { background: #ffedd5; color: #7c2d12; }
+.pi-rel-low       { background: #fee2e2; color: #7f1d1d; }
+
+.pi-fatwa-crumb {
+  font-family: var(--font-en);
+  font-size: 0.7rem;
+  color: var(--text-sec);
+  padding: 2px 8px;
+  background: var(--surface2);
+  border-radius: var(--radius-sm);
+}
+
+.pi-fatwa-title {
+  font-family: var(--font-ur);
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--pi-accent-deep);
+  direction: rtl;
+  text-align: right;
+  line-height: 1.7;
+  margin-bottom: 8px;
+}
+
+.pi-fatwa-q {
+  font-family: var(--font-ur);
+  font-size: 0.88rem;
+  color: var(--text-pri);
+  direction: rtl;
+  text-align: right;
+  line-height: 1.8;
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  background: var(--surface2);
+  border-radius: var(--radius-sm);
+  border-right: 3px solid var(--pi-accent-soft);
+}
+
+.pi-fatwa-qlabel, .pi-fatwa-alabel {
+  font-weight: 700;
+  color: var(--pi-accent-deep);
+  font-size: 0.78rem;
+  display: block;
+  margin-bottom: 4px;
+}
+
+.pi-fatwa-a {
+  font-family: var(--font-ur);
+  font-size: 0.86rem;
+  color: var(--text-pri);
+  direction: rtl;
+  text-align: right;
+  line-height: 2.0;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  max-height: 350px;
+  overflow-y: auto;
+}
+
+.pi-fatwa-a--collapsed {
+  max-height: 80px;
+  overflow: hidden;
+  position: relative;
+}
+.pi-fatwa-a--collapsed::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 40px;
+  background: linear-gradient(transparent, var(--bg));
+}
+
+.pi-expand-btn {
+  display: block;
+  width: 100%;
+  padding: 6px;
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--pi-accent);
+  font-family: var(--font-ur);
+  font-size: 0.78rem;
+  cursor: pointer;
+  margin-bottom: 8px;
+  transition: background .15s;
+}
+.pi-expand-btn:hover { background: var(--pi-accent-soft); }
+
+.pi-fatwa-a::-webkit-scrollbar       { width: 4px; }
+.pi-fatwa-a::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* ── Fatwa footer: URL + actions ─────────────────────────────────────── */
+.pi-fatwa-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pi-fatwa-url {
+  font-family: var(--font-en);
+  font-size: 0.72rem;
+  color: var(--green-500);
+  text-decoration: none;
+  word-break: break-all;
+  line-height: 1.4;
+  flex: 1;
+  min-width: 0;
+}
+.pi-fatwa-url:hover { text-decoration: underline; color: var(--green-400); }
+.pi-fatwa-url--none { color: var(--text-muted); font-style: italic; }
+
+.pi-summarise-btn {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  background: var(--pi-accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-ur);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter .15s;
+  white-space: nowrap;
+}
+.pi-summarise-btn:hover    { filter: brightness(1.1); }
+.pi-summarise-btn:disabled { background: var(--text-muted); cursor: not-allowed; }
+
+/* ── Summary block (injected after خلاصہ) ───────────────────────────── */
+.pi-summary-block {
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: var(--pi-accent-soft);
+  border-right: 3px solid var(--pi-accent);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-ur);
+  font-size: 0.85rem;
+  direction: rtl;
+  color: var(--text-pri);
+  line-height: 1.85;
+}
