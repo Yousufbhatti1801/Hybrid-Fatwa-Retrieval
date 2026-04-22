@@ -20,6 +20,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+import re
 
 from src.config import get_settings
 from src.embedding.embedder import embed_single
@@ -36,8 +37,10 @@ logger = logging.getLogger(__name__)
 # Increased from 3 → 5: with a large corpus, 3×top_k gives the fusion step
 # too little headroom.  At 5× the extra Pinecone overhead is <5ms but recall
 # improves measurably, especially for minority categories (ZAKAT, HAJJ, etc.).
-_CANDIDATE_MULTIPLIER = 3
+_CANDIDATE_MULTIPLIER = 5
 _MIN_CANDIDATES = 30   # never fetch fewer than this, even for very small top-k
+# Small bonus for candidates corroborated by BOTH dense and sparse paths.
+_DUAL_PATH_BONUS = 0.06
 
 import re as _re_dedupe
 # Strip whitespace, zero-width chars, Arabic diacritics, and punctuation
@@ -145,6 +148,52 @@ def _minmax_normalize(scores: dict[str, float]) -> dict[str, float]:
     return {k: (v - lo) / span for k, v in scores.items()}
 
 
+_MASLAK_VARIANTS: dict[str, tuple[str, ...]] = {
+    "deobandi": (
+        "Deobandi", "deobandi",
+    ),
+    "barelvi": (
+        "Barelvi", "barelvi", "Barelwi", "barelwi",
+    ),
+    "ahle_hadees": (
+        "Ahle Hadees", "Ahle Hadith", "Ahl-e-Hadees", "Ahl-e-Hadith",
+        "ahle_hadees", "ahle_hadith",
+    ),
+    "salafi": (
+        "Salafi", "salafi",
+    ),
+}
+
+
+def _normalize_maslak(value: str) -> str:
+    """Normalize user/stored maslak labels to a canonical key."""
+    v = (value or "").strip().lower()
+    if not v:
+        return ""
+    alnum = re.sub(r"[^a-z]+", "", v)
+    if "deoband" in alnum:
+        return "deobandi"
+    if any(x in alnum for x in ("barelvi", "barelwi", "bareilvi", "brelvi")):
+        return "barelvi"
+    if "salaf" in alnum:
+        return "salafi"
+    if "hadith" in alnum or "hadees" in alnum:
+        return "ahle_hadees"
+    return alnum
+
+
+def _maslak_filter_values(maslak: str | None) -> list[str]:
+    """Return Pinecone filter variants for a maslak label."""
+    if not maslak:
+        return []
+    key = _normalize_maslak(maslak)
+    variants = _MASLAK_VARIANTS.get(key)
+    if variants:
+        return list(variants)
+    val = (maslak or "").strip()
+    return [val] if val else []
+
+
 # ── Dense retrieval (Pinecone) ────────────────────────────────────────────────
 
 def _dense_search(
@@ -178,7 +227,11 @@ def _dense_search(
     if category:
         filters.append({"category": {"$eq": category}})
     if maslak:
-        filters.append({"maslak": {"$eq": maslak}})
+        maslak_vals = _maslak_filter_values(maslak)
+        if len(maslak_vals) == 1:
+            filters.append({"maslak": {"$eq": maslak_vals[0]}})
+        elif len(maslak_vals) > 1:
+            filters.append({"maslak": {"$in": maslak_vals}})
     if len(filters) == 1:
         kwargs["filter"] = filters[0]
     elif len(filters) > 1:
@@ -245,10 +298,11 @@ def _sparse_search(
             if meta.get("category", "") == category
         }
     if maslak:
+        want = _normalize_maslak(maslak)
         results = {
             cid: (score, meta)
             for cid, (score, meta) in results.items()
-            if meta.get("maslak", "") == maslak
+            if _normalize_maslak(str(meta.get("maslak", ""))) == want
         }
     return results
 
@@ -264,7 +318,8 @@ def hybrid_search(
     *,
     category: str | None = None,
     maslak: str | None = None,
-    question_boost: float = 0.15,
+    question_boost: float | None = None,
+    min_dense_raw_score: float | None = None,
 ) -> list[dict]:
     """Run a hybrid query and return ranked results.
 
@@ -291,10 +346,13 @@ def hybrid_search(
         ``"Ahle Hadees"``, or ``"Salafi"``.  Restricts both Pinecone and BM25
         results to the chosen school.  When *None*, all schools are searched.
     question_boost:
-        Additive weight (default ``0.15``) applied to a third BM25 score
-        computed over the **question field only**.  This rewards results
-        where the query closely matches a fatwa\'s original question.
+        Additive weight for BM25 over the fatwa **question** field only.
+        When ``None``, uses ``settings.retrieval_question_boost``.
         Set to ``0.0`` to disable.
+    min_dense_raw_score:
+        Minimum Pinecone cosine score before fusion. Weak dense matches are
+        dropped.  When ``None``, uses ``settings.retrieval_min_pinecone_score``.
+        Set to ``0.0`` to disable filtering.
 
     Returns
     -------
@@ -319,6 +377,16 @@ def hybrid_search(
     top_k = top_k if top_k is not None else settings.top_k
     dw = dense_weight if dense_weight is not None else settings.dense_weight
     sw = sparse_weight if sparse_weight is not None else settings.sparse_weight
+    q_boost = (
+        question_boost
+        if question_boost is not None
+        else settings.retrieval_question_boost
+    )
+    dense_floor = (
+        min_dense_raw_score
+        if min_dense_raw_score is not None
+        else settings.retrieval_min_pinecone_score
+    )
     candidates = max(_MIN_CANDIDATES, top_k * _CANDIDATE_MULTIPLIER)
 
     import time as _t
@@ -351,7 +419,7 @@ def hybrid_search(
             )
             # Question-boost BM25 runs in parallel too (was sequential)
             qboost_future: Future | None = None
-            if question_boost > 0:
+            if q_boost > 0:
                 qboost_future = pool.submit(
                     bm25_corpus.score_questions, normalised, candidates,
                 )
@@ -365,6 +433,19 @@ def hybrid_search(
         sparse_hits = {}
         raw_q_scores = {}
     _t_search = (_t.perf_counter() - _t0) * 1000
+
+    # Drop anemic dense matches (cosine) — reduces wrong-topic vector hits
+    if dense_floor > 0 and dense_hits:
+        before = len(dense_hits)
+        dense_hits = {
+            k: v for k, v in dense_hits.items() if v[0] >= dense_floor
+        }
+        logger.info(
+            "Dense score filter ≥%.3f: %d → %d vectors",
+            dense_floor,
+            before,
+            len(dense_hits),
+        )
 
     logger.info(
         "[hybrid_search] norm=%.0fms bm25load=%.0fms embed=%.0fms search=%.0fms "
@@ -393,7 +474,9 @@ def hybrid_search(
         d_score = norm_dense.get(cid, 0.0)
         s_score = norm_sparse.get(cid, 0.0)
         q_score = norm_q.get(cid, 0.0)
-        final = dw * d_score + sw * s_score + question_boost * q_score
+        final = dw * d_score + sw * s_score + q_boost * q_score
+        if d_score > 0 and s_score > 0:
+            final += _DUAL_PATH_BONUS
 
         # Prefer metadata from the dense path (richer Pinecone payload);
         # fall back to BM25 metadata if the chunk only appeared there.
@@ -427,7 +510,7 @@ def hybrid_search(
         "Hybrid search | dense=%d sparse=%d q_boost=%d merged=%d returned=%d"
         " | category=%s question_boost=%.2f | query=%.60s",
         len(dense_hits), len(sparse_hits), len(norm_q), len(fused), len(results),
-        category or "*", question_boost, query,
+        category or "*", q_boost, query,
     )
     return results
 
@@ -441,7 +524,8 @@ def hybrid_search_as_chunks(
     *,
     category: str | None = None,
     maslak: str | None = None,
-    question_boost: float = 0.15,
+    question_boost: float | None = None,
+    min_dense_raw_score: float | None = None,
 ) -> list[RetrievedChunk]:
     """Same as ``hybrid_search`` but returns ``RetrievedChunk`` dataclass objects.
 
@@ -450,6 +534,7 @@ def hybrid_search_as_chunks(
     raw = hybrid_search(
         query, top_k, dense_weight, sparse_weight, bm25_corpus,
         category=category, maslak=maslak, question_boost=question_boost,
+        min_dense_raw_score=min_dense_raw_score,
     )
     return [
         RetrievedChunk(

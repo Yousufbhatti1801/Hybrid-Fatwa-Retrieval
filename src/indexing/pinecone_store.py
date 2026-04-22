@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from itertools import islice
 from typing import Any, Iterator
@@ -31,8 +32,11 @@ _BATCH_MIN = 100
 _BATCH_MAX = 500
 
 # Pinecone metadata values must be str / int / float / bool / list[str].
-# We truncate long text fields to stay within the 40 KB-per-vector limit.
-_MAX_META_TEXT_LEN = 4_000
+# We truncate long text fields to stay within the 40 KB-per-vector limit
+# AND, more importantly, the 2 MB-per-upsert-request limit.  With 200
+# vectors/batch and two 2 KB text fields per vector, we sit at ~800 KB
+# per request (plus dense vectors) — safely inside the 2 MB cap.
+_MAX_META_TEXT_LEN = 2_000
 
 
 # ── Internal helpers ──────────────────────────────────────────────────
@@ -121,8 +125,15 @@ def _make_metadata_from_dict(record_meta: dict) -> dict:
         "chunk_index": int(record_meta.get("chunk_index", 0)),
         "total_chunks": int(record_meta.get("total_chunks", 1)),
         "length_flag": _clean(record_meta.get("length_flag", "normal")),
-        # ── text stored for display without re-fetch ──────────────────
-        "text":        _clean(_trunc(record_meta.get("text", ""))),
+        # NOTE: the ``text`` field is intentionally NOT stored in Pinecone
+        # metadata.  It would be identical to ``question + answer`` and
+        # would triple the per-request payload, tripping Pinecone's 2 MB
+        # upsert size limit.  Retrieval code (retrieve.py, hybrid_retriever.py)
+        # reconstructs ``text`` from ``question + answer`` when needed.
+        # ── Islam360 / generic corpus tags ───────────────────────────
+        "scholar":     _clean(record_meta.get("scholar", "")),
+        "language":    _clean(record_meta.get("language", "")),
+        "corpus_source": _clean(record_meta.get("corpus_source", record_meta.get("fatwa_source", ""))),
     }
 
 
@@ -148,29 +159,46 @@ def init_index() -> Any:
     Returns a live index handle.  Result is cached after first call.
     """
     settings = get_settings()
-    pc = _get_client()
+    return ensure_serverless_index(
+        settings.pinecone_index_name,
+        settings.embedding_dimensions,
+        metric=settings.pinecone_metric,
+        cloud=settings.pinecone_cloud,
+        region=settings.pinecone_region,
+    )
 
+
+def ensure_serverless_index(
+    index_name: str,
+    dimension: int,
+    *,
+    metric: str | None = None,
+    cloud: str | None = None,
+    region: str | None = None,
+) -> Any:
+    """Create the index if missing, then return a live ``Index`` handle."""
+    settings = get_settings()
+    pc = _get_client()
+    metric = metric or settings.pinecone_metric
+    cloud = cloud or settings.pinecone_cloud
+    region = region or settings.pinecone_region
     existing_names = {idx.name for idx in pc.list_indexes()}
-    if settings.pinecone_index_name not in existing_names:
+    if index_name not in existing_names:
         pc.create_index(
-            name=settings.pinecone_index_name,
-            dimension=settings.embedding_dimensions,
-            metric=settings.pinecone_metric,
-            spec=ServerlessSpec(
-                cloud=settings.pinecone_cloud,
-                region=settings.pinecone_region,
-            ),
+            name=index_name,
+            dimension=dimension,
+            metric=metric,
+            spec=ServerlessSpec(cloud=cloud, region=region),
         )
         logger.info(
             "Created Pinecone index '%s' (dim=%d, metric=%s)",
-            settings.pinecone_index_name,
-            settings.embedding_dimensions,
-            settings.pinecone_metric,
+            index_name,
+            dimension,
+            metric,
         )
     else:
-        logger.info("Using existing Pinecone index '%s'", settings.pinecone_index_name)
-
-    return pc.Index(settings.pinecone_index_name)
+        logger.info("Using existing Pinecone index '%s'", index_name)
+    return pc.Index(index_name)
 
 
 def index_stats() -> dict:
@@ -503,3 +531,90 @@ def validate_index_coverage(
         result_dict["coverage_pct"],
     )
     return result_dict
+
+
+def upsert_to_named_index(
+    index_name: str,
+    dimension: int,
+    records: Iterable[dict],
+    *,
+    batch_size: int | None = None,
+    skip_existing: bool = True,
+    show_progress: bool = True,
+) -> dict:
+    """Like ``upsert_records`` but targets a specific index (e.g. Islam360 1536-dim)."""
+    settings = get_settings()
+    effective_batch = _clamp_batch_size(batch_size or settings.batch_size)
+    index = ensure_serverless_index(index_name, dimension)
+
+    upserted = 0
+    skipped = 0
+    total = 0
+
+    # ── Parallel upsert pool ────────────────────────────────────────
+    # Pinecone serverless upsert latency is ~15–25 s per batch of 200 vectors.
+    # That's network- and server-bound, not CPU-bound, so we can keep several
+    # upsert requests in flight at once.  A pool of 4 workers turns a ~20 s
+    # sequential step into a ~5 s effective step, giving us ~30–40 vec/s
+    # end-to-end with no extra API cost.
+    _UPSERT_PARALLELISM = 4
+    pool = ThreadPoolExecutor(max_workers=_UPSERT_PARALLELISM)
+    in_flight: list[Future[int]] = []
+
+    def _drain(block_on_all: bool = False) -> None:
+        """Collect completed upsert futures, update counters, update progress."""
+        nonlocal upserted, in_flight
+        remaining: list[Future[int]] = []
+        for fut in in_flight:
+            if block_on_all or fut.done():
+                count = fut.result()  # re-raises any exception from the worker
+                upserted += count
+                pbar.update(count)
+                logger.info("Upserted %d vectors to %s", count, index_name)
+            else:
+                remaining.append(fut)
+        in_flight = remaining
+
+    def _upsert_one(vectors: list[dict[str, Any]]) -> int:
+        index.upsert(vectors=vectors)
+        return len(vectors)
+
+    with tqdm(desc=f"Pinecone→{index_name}", unit="vec", disable=not show_progress) as pbar:
+        try:
+            for batch in _batched(records, effective_batch):
+                total += len(batch)
+                if skip_existing:
+                    batch_ids = [r["id"] for r in batch]
+                    existing_in_batch = _fetch_existing_ids(index, batch_ids)
+                    if existing_in_batch:
+                        skipped += len(existing_in_batch)
+                        batch = [r for r in batch if r["id"] not in existing_in_batch]
+                if not batch:
+                    continue
+                vectors = [
+                    {
+                        "id":       r["id"],
+                        "values":   r["embedding"],
+                        "metadata": _make_metadata_from_dict(r.get("metadata", {})),
+                    }
+                    for r in batch
+                ]
+                # Back-pressure: never let more than _UPSERT_PARALLELISM
+                # requests sit in flight at once, otherwise embedding will
+                # race ahead and queue unbounded work in RAM.
+                while len(in_flight) >= _UPSERT_PARALLELISM:
+                    _drain(block_on_all=False)
+                    if len(in_flight) >= _UPSERT_PARALLELISM:
+                        # Pool is saturated; wait for at least one to finish.
+                        next(as_completed(in_flight))
+                        _drain(block_on_all=False)
+                in_flight.append(pool.submit(_upsert_one, vectors))
+
+            # Flush anything still in flight at end of stream.
+            _drain(block_on_all=True)
+        finally:
+            pool.shutdown(wait=True)
+
+    summary = {"upserted": upserted, "skipped": skipped, "total": total}
+    logger.info("upsert_to_named_index complete: %s", summary)
+    return summary

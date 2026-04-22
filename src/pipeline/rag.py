@@ -24,8 +24,46 @@ from src.pipeline.context_trimmer import trim_to_budget
 from src.pipeline.prompt_builder import build_messages, build_prompt, NO_ANSWER_SENTINEL
 from src.preprocessing.urdu_normalizer import normalize_urdu
 from src.retrieval.hybrid_retriever import hybrid_search
+from src.retrieval.llm_rerank import rerank_fatwa_candidates
 
 logger = logging.getLogger(__name__)
+
+
+def retrieve_with_rerank(
+    normalised_query: str,
+    *,
+    user_question: str,
+    top_k: int | None = None,
+    dense_weight: float | None = None,
+    sparse_weight: float | None = None,
+    category: str | None = None,
+    maslak: str | None = None,
+    bm25_corpus: object | None = None,
+) -> list[dict]:
+    """Hybrid retrieve with optional LLM re-rank (settings-controlled)."""
+    settings = get_settings()
+    k = top_k if top_k is not None else settings.top_k
+    if settings.retrieval_rerank_enabled:
+        pool = max(settings.retrieval_rerank_pool, k * 3)
+        raw = hybrid_search(
+            normalised_query,
+            top_k=pool,
+            dense_weight=dense_weight,
+            sparse_weight=sparse_weight,
+            bm25_corpus=bm25_corpus,
+            category=category,
+            maslak=maslak,
+        )
+        return rerank_fatwa_candidates(user_question, raw, final_k=k)
+    return hybrid_search(
+        normalised_query,
+        top_k=k,
+        dense_weight=dense_weight,
+        sparse_weight=sparse_weight,
+        bm25_corpus=bm25_corpus,
+        category=category,
+        maslak=maslak,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -99,8 +137,9 @@ def query(
 
     # ── Step 2+3: Hybrid retrieval (embed + dense + BM25 + fusion) ───────────
     t0 = time.perf_counter()
-    retrieved = hybrid_search(
+    retrieved = retrieve_with_rerank(
         normalised,
+        user_question=question,
         top_k=top_k,
         dense_weight=dense_weight,
         sparse_weight=sparse_weight,
@@ -143,7 +182,7 @@ def query(
 
     return {
         "answer":     answer,
-        "sources":    [r["metadata"] for r in trimmed],
+        "sources":    [{"score": r.get("score", 0.0), "metadata": r.get("metadata", r)} for r in trimmed],
         "num_chunks": len(trimmed),
         "prompt":     user_message,
         "timings": {

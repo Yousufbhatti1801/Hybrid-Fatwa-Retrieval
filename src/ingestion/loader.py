@@ -125,9 +125,10 @@ def load_csv_as_dicts(path: Path) -> list[dict]:
             "source_file": str,   # CSV filename
             "folder":      str,   # data-source folder (e.g. "Banuri-ExtractedData-Output")
             "source_name": str,   # human-readable source (e.g. "Banuri Institute")
+            "maslak":      str,   # school of thought (e.g. "Deobandi", "Barelvi", "Ahle Hadees")
         }
     """
-    from src.preprocessing.chunker import get_source_display_name  # lazy import
+    from src.preprocessing.chunker import get_source_display_name, get_source_maslak  # lazy import
 
     parts = path.parts
     source = parts[-3]
@@ -159,6 +160,7 @@ def load_csv_as_dicts(path: Path) -> list[dict]:
                 "source_file": path.name,
                 "folder": source,
                 "source_name": get_source_display_name(source),
+                "maslak": get_source_maslak(source),
             }
         )
 

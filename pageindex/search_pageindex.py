@@ -1,14 +1,16 @@
 """LLM-driven tree navigation over the parsed PageIndex tree.
 
-This is the **vectorless retrieval** path. For each madhab we run two
-``gpt-4o-mini`` calls in sequence:
+This is the **vectorless retrieval** path. The caller first normalises and
+expands the query (``pipeline_pageindex`` + ``query_enrich``).  For each
+madhab, we run (LLM) tree navigation and two ranking stages:
 
-  1. ``_pick_categories_and_topics`` — show the LLM the school's
-     (category, topic) sub-tree and ask which 1-2 categories and 1-5
-     topics are most relevant.
-  2. ``_pick_fatwa`` — show the LLM the leaf fatwa titles under those
-     chosen topics (capped at 200) and ask which single fatwa best
-     answers the question.
+  1. ``_pick_categories_and_topics`` — pick categories + topics in the
+     compact tree.
+  2. ``_pick_fatwas`` (Step B) — keyword-scored candidates (optionally
+     using Q+A from the flat lookup, not the title alone) then an LLM
+     re-rank on full masʾala text.
+  3. ``_refine_cid_order`` (pass 2) — optional second LLM that re-orders
+     a short list of composite ids for precision.
 
 The chosen fatwa is then resolved against ``fatawa_lookup.json`` (a
 plain dict, no LLM) and a relevance percent is computed via keyword
@@ -91,6 +93,160 @@ _SCHOOL_INDEX: dict[str, dict] | None = None  # school_id → school subtree
 @lru_cache(maxsize=1)
 def _client() -> OpenAI:
     return OpenAI(api_key=get_settings().openai_api_key)
+
+
+def _cat_title_matches_hint(title: str, hint: str) -> bool:
+    """Match category node title to ``category_hint`` (supports ``NAMAZ — …``)."""
+    if not title or not hint:
+        return False
+    h = hint.strip().upper()
+    raw = title.strip()
+    t = raw.upper()
+    if t == h or t.startswith(h + " "):
+        return True
+    for sep in ("—", "\u2013", "-"):
+        if sep in raw:
+            first = raw.split(sep, 1)[0].strip().upper()
+            if first == h:
+                return True
+    return False
+
+
+def _lookup_haystack_for_scoring(
+    rec: dict, leaf_title: str,
+) -> str:
+    """Match terms against masʾala + reference lines only.
+
+    Including long ``answer_text`` was the main source of *false* lexical
+    hits: generic fiqh discussion mentions many terms unrelated to the
+    user's specific question.
+    """
+    best_q = _best_question_line(rec, leaf_title)
+    return " ".join(
+        p
+        for p in (
+            leaf_title,
+            best_q,
+            rec.get("query_text", ""),
+        )
+        if p
+    ).lower()
+
+
+_BOILERPLATE_SNIPPETS = (
+    "dar-ul-ifta",
+    "darulifta",
+    "www.",
+    "feedback@",
+    "اَلْجَوَابُ",
+    "الجواب",
+    "بِسْمِ اللہ",
+    "بسم الله",
+    "وَاللہُ اَعْلَم",
+    "والله اعلم",
+)
+
+
+def _is_boilerplate_question_line(text: str) -> bool:
+    """Heuristic guard against template boilerplate posing as a question."""
+    t = " ".join((text or "").split()).strip().lower()
+    if not t:
+        return True
+    if len(t) < 12 and "؟" not in t and "?" not in t:
+        return True
+    return any(snippet in t for snippet in _BOILERPLATE_SNIPPETS)
+
+
+def _best_question_line(rec: dict, fallback_title: str) -> str:
+    """Pick the most question-like text from lookup fields."""
+    candidates = [
+        (rec.get("question_text") or "").strip(),
+        (rec.get("query_text") or "").strip(),
+        (fallback_title or "").strip(),
+    ]
+    for c in candidates:
+        if c and not _is_boilerplate_question_line(c):
+            return c
+    for c in candidates:
+        if c:
+            return c
+    return ""
+
+
+_U2_STOP2 = frozenset(
+    {"کے", "میں", "سے", "کا", "کی", "نہ", "وہ", "یہ", "تو", "کو", "پر",
+     "is", "of", "in", "or", "to", "a", "it"},
+)
+_UR2 = re.compile(r"[\u0600-\u06FF\u0750-\u077Fa-zA-Z]{2,}")
+
+
+def _urdu_scoring_tokens(text: str, *, cap: int = 18) -> list[str]:
+    """Tokenize for *matching*; 2+ codepoints (3+ was dropping real terms)."""
+    if not (text or "").strip():
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in _UR2.findall((text or "").lower()):
+        if t in _U2_STOP2 and len(t) < 3:
+            continue
+        if t in seen or len(t) < 2:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _raw_phrase_substring_bonus(hay: str, raw: str) -> int:
+    """When the user asked a long specific phrase, reward leaves whose text
+    contains the same 2+ word n-grams or a long sub-span (common for Urdu fiqh
+    fatawa where keyword bags fail).
+    """
+    if not (raw and hay):
+        return 0
+    h = re.sub(r"[\n\r\t]+", " ", hay.lower().strip())
+    r = re.sub(r"[\n\r\t]+", " ", raw.lower().strip())
+    b = 0
+    if len(r) > 4 and r in h:
+        b += 20
+    parts = [p for p in r.split() if len(p) > 1]
+    for i in range(len(parts) - 1):
+        w2 = f"{parts[i]} {parts[i+1]}"
+        if len(w2) > 3 and w2 in h:
+            b += 8
+    for i in range(len(parts) - 2):
+        w3 = f"{parts[i]} {parts[i+1]} {parts[i+2]}"
+        if len(w3) > 6 and w3 in h:
+            b += 10
+    return b
+
+
+def _tight_scoring_tokens(
+    core_q: str,
+    full_kw: list[str] | None,
+    raw_user: str = "",
+) -> list[str]:
+    """Tight token set + user's exact wording for bucket pre-scoring."""
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    def _ad(t: str) -> None:
+        t = t.strip().lower()
+        if len(t) < 2 or t in seen:
+            return
+        if len(t) < 3 and t in _U2_STOP2:
+            return
+        seen.add(t)
+        merged.append(t)
+
+    for t in _urdu_scoring_tokens(raw_user, cap=10):
+        _ad(t)
+    for t in _urdu_scoring_tokens(core_q, cap=10):
+        _ad(t)
+    for k in (full_kw or []):
+        _ad((k or "").lower())
+    return merged[:18]
 
 
 def _load_tree() -> dict:
@@ -313,7 +469,8 @@ _PICK_CT_SYSTEM = (
 )
 
 _PICK_CT_USER = (
-    "صارف کا سوال (Urdu user question):\n{q}\n\n"
+    "صارف کے اصل الفاظ (as typed / original):\n{raw}\n\n"
+    "تحلیل شدہ سوال (analysed / standard Urdu line):\n{q}\n\n"
     "Optional category hint: {hint}\n\n"
     "نیچے {school_label} کی categories اور ان کے اندر topics/groups ہیں۔\n"
     "Some categories have themed 'super-groups' shown as parenthetical "
@@ -334,6 +491,7 @@ def _pick_categories_and_topics(
     school_node: dict,
     core_question: str,
     category_hint: str | None,
+    user_raw: str = "",
 ) -> dict:
     # Use pre-computed compact tree if available (populated during preload)
     if school_id in _COMPACT_TREES:
@@ -346,6 +504,7 @@ def _pick_categories_and_topics(
 
     settings = get_settings()
     user_msg = _PICK_CT_USER.format(
+        raw=(user_raw or core_question)[:1500],
         q=core_question,
         hint=category_hint or "none",
         school_label=_SCHOOL_LABEL.get(school_id, school_id),
@@ -363,8 +522,8 @@ def _pick_categories_and_topics(
                 {"role": "user",   "content": user_msg},
             ],
         )
-        raw = comp.choices[0].message.content or "{}"
-        parsed = json.loads(raw)
+        llm_json = comp.choices[0].message.content or "{}"
+        parsed = json.loads(llm_json)
     except Exception as exc:
         logger.warning("[%s] Step A LLM call failed: %s", school_id, exc)
         parsed = {}
@@ -396,7 +555,8 @@ def _pick_categories_and_topics(
 # ──────────────────────────────────────────────────────────────────────────
 
 _PICK_SUB_USER = (
-    "صارف کا سوال: {q}\n\n"
+    "صارف (اصل): {raw}\n\n"
+    "تحلیل: {q}\n\n"
     'نیچے "{group_label}" گروپ کے اندر موجود subtopics کی فہرست ہے:\n'
     "{subtopics}\n\n"
     "Pick at most 3 subtopic_node_ids most relevant to the question.\n"
@@ -408,6 +568,7 @@ def _pick_subtopics_within_group(
     school_id: str,
     group_node: dict,
     core_question: str,
+    user_raw: str = "",
 ) -> list[dict]:
     """Step A.5 — narrow a super-group to its most relevant subtopics.
 
@@ -435,6 +596,7 @@ def _pick_subtopics_within_group(
 
     settings = get_settings()
     user_msg = _PICK_SUB_USER.format(
+        raw=(user_raw or core_question)[:1500],
         q=core_question,
         group_label=group_node.get("title", ""),
         subtopics="\n".join(lines),
@@ -451,7 +613,8 @@ def _pick_subtopics_within_group(
                 {"role": "user",   "content": user_msg},
             ],
         )
-        parsed = json.loads(comp.choices[0].message.content or "{}")
+        llm_text = comp.choices[0].message.content or "{}"
+        parsed = json.loads(llm_text)
     except Exception as exc:
         logger.warning("[%s] Step A.5 failed: %s", school_id, exc)
         parsed = {}
@@ -471,47 +634,37 @@ def _pick_subtopics_within_group(
 _PICK_FATWA_SYSTEM = _PICK_CT_SYSTEM
 
 _PICK_FATWA_USER = (
-    "صارف کا سوال (Urdu user question):\n{q}\n"
+    "صارف (اصل): {raw}\n\n"
+    "تحلیل: {q}\n"
     "Madhab: {school_label}\n\n"
-    "نیچے متعلقہ فتاویٰ کی فہرست ہے۔ Each line starts with a short id "
-    "like [f0001], [f0002] — these are the IDs you must return.\n"
-    f"(list capped at {_MAX_FATWA_CANDIDATES} and pre-ranked by keyword "
-    "overlap — but YOU must re-rank by actual semantic relevance to the "
-    "user's Urdu question, not by keyword match alone)\n"
+    "نیچے فتاویٰ کے امیدوار — ہر سطر: [f-id] + مسئلہ/سوال (tree یا حوالہ)۔\n"
+    f"(تقریباً {_MAX_FATWA_CANDIDATES} سے کم؛ پہلے کلیدی الفاظ/مکمل جملے سے"
+    " ترتیب دیے گئے)\n"
+    "You are a **semantic re-ranker** — use each line's *question* text.\n"
+    "Do **not** pick a fatwa about a *different* fiqh issue just because a word"
+    " overlaps. Wrong-topic matches must be ranked last or omitted.\n"
     "{titles}\n\n"
-    "Task: **rank the top {top_n} fatwas** that most directly answer the "
-    "user's question, from most to least relevant. You are acting as a "
-    "semantic re-ranker on top of a keyword filter, so prefer fatwas that "
-    "match the actual meaning of the question, not just its surface words. "
-    "**You MUST return f-ids from the list above** (e.g. \"f0007\"), "
-    "exactly as written, including the leading 'f' and 4 digits. "
-    "Do not invent ids that are not in the list. "
-    'Return STRICT JSON: {{"ranked_fatwa_ids": '
-    '["f0007", "f0012", "f0019", "f0025"], '
+    "Task: **Rank the best {top_n} fatwas** for this **exact** user masʾala (same"
+    " hukm / same issue). **You MUST return f-ids only from the list.** "
+    'Return STRICT JSON: {{"ranked_fatwa_ids": ["f0007", "f0012"], '
     '"confidence": "high|medium|low"}}. '
-    "Return an empty list ONLY if the list is genuinely empty or no title "
-    "is even loosely related. Otherwise return at least one id, up to {top_n}."
+    "If every candidate is off-topic, return {[]} — do not force a wrong result."
 )
 
 
 def _gather_fatwa_candidates(
     topic_nodes: list[dict],
     query_keywords: list[str] | None = None,
+    user_raw_for_phrase: str = "",
 ) -> tuple[list[dict], dict[str, str]]:
-    """Walk all leaves under the chosen topics and return the top
-    ``_MAX_FATWA_CANDIDATES`` ranked by keyword overlap with
-    ``query_keywords``.
-
-    For huge buckets (Banuri's talaaq has 4423 fatawa) the previous
-    alphabetical-first-200 strategy was essentially random. Pre-filtering
-    by keyword overlap ensures the LLM sees the most relevant titles
-    even when the topic is large.
-
-    Returns ``(candidate_records, fid_to_composite_id)``. Each candidate
-    is ``{"fid": str, "title": str}``; ``fid_to_cid`` maps the short id
-    in the prompt to the real composite lookup key.
+    """Walk all leaves and return the top ``_MAX_FATWA_CANDIDATES`` by
+    lexical match: when enabled, use question+answer from the flat
+    lookup, not the tree title alone, plus expanded search terms.
     """
-    # 1. Walk every leaf, scoring it by overlap with query_keywords.
+    settings = get_settings()
+    use_lookup = bool(settings.pageindex_lookup_scoring)
+    lookup = _load_lookup() if use_lookup else None
+
     keywords = [k.lower() for k in (query_keywords or []) if len(k) > 1]
     scored: list[tuple[int, str, str]] = []  # (score, title, composite_id)
     for topic in topic_nodes:
@@ -519,20 +672,55 @@ def _gather_fatwa_candidates(
             cid = leaf.get("fatwa_id")
             if not cid:
                 continue
-            title = (leaf.get("title") or "")[:140]
-            if keywords:
+            title = (leaf.get("title") or "")[:500]
+            if use_lookup and lookup and cid in lookup:
+                rec = lookup[cid]
+                hay = _lookup_haystack_for_scoring(rec, title)
+                title_for_rank = _best_question_line(rec, title)
+                qline = (rec.get("question_text") or "")
+                qline_l = qline.lower()
+                qtext_l = (rec.get("query_text") or "").lower()
+            else:
                 hay = title.lower()
-                score = sum(1 for k in keywords if k in hay)
+                title_for_rank = title
+                qline_l = ""
+                qtext_l = ""
+
+            if keywords:
+                score = 0
+                for k in keywords:
+                    if k in qline_l:
+                        score += 4
+                    elif k in qtext_l:
+                        score += 3
+                    elif k in hay:
+                        score += 2
+                # Longer tokens are usually more specific in fiqh queries.
+                score += sum(1 for k in keywords if len(k) >= 5 and k in hay)
             else:
                 score = 0
-            scored.append((score, title, cid))
+            score += _raw_phrase_substring_bonus(hay, user_raw_for_phrase)
+            if use_lookup and lookup and cid in lookup and _is_boilerplate_question_line(qline):
+                score -= 2
+            scored.append((score, title_for_rank, cid))
 
-    # 2. Sort by score desc, ties broken alphabetically (stable order).
+    if not scored:
+        return [], {}
+
     scored.sort(key=lambda x: (-x[0], x[1]))
 
-    # 3. Take the top _MAX_FATWA_CANDIDATES, but ALWAYS include at least
-    #    a few examples from each chosen topic so the LLM has variety even
-    #    when keyword overlap is weak.
+    # If every candidate has zero lexical support, avoid forcing a random
+    # off-topic branch into Step B.
+    best_score = scored[0][0]
+    if keywords and best_score <= 0:
+        return [], {}
+
+    if best_score > 0:
+        floor = max(1, int(best_score * 0.25))
+        pruned = [row for row in scored if row[0] >= floor]
+        if len(pruned) >= min(24, _MAX_FATWA_CANDIDATES):
+            scored = pruned
+
     top = scored[:_MAX_FATWA_CANDIDATES]
 
     candidates: list[dict] = []
@@ -550,6 +738,7 @@ def _pick_fatwas(
     topic_nodes: list[dict],
     query_keywords: list[str] | None = None,
     top_n: int = _DEFAULT_TOP_N_PER_SCHOOL,
+    user_raw: str = "",
 ) -> list[str]:
     """LLM re-rank pass over the pre-filtered candidates.
 
@@ -558,14 +747,29 @@ def _pick_fatwas(
     keyword-overlap pre-filter). Empty list on total failure.
     """
     candidates, fid_to_cid = _gather_fatwa_candidates(
-        topic_nodes, query_keywords=query_keywords
+        topic_nodes,
+        query_keywords=query_keywords,
+        user_raw_for_phrase=(user_raw or core_question)[:2000],
     )
     if not candidates:
         return []
 
-    titles_blob = "\n".join(f"[{c['fid']}] {c['title']}" for c in candidates)
+    lookup = _load_lookup()
+    lines: list[str] = []
+    for c in candidates:
+        fid = c["fid"]
+        cid = fid_to_cid.get(fid) or ""
+        rec = (lookup or {}).get(cid) if cid else None
+        qv = c.get("title", "")
+        if rec:
+            qv = _best_question_line(rec, c.get("title", ""))
+        qv = (qv or "—")[:300].replace("\n", " ")
+        lines.append(f"[{fid}] {qv}")
+
+    titles_blob = "\n".join(lines)
     settings = get_settings()
     user_msg = _PICK_FATWA_USER.format(
+        raw=(user_raw or core_question)[:2000],
         q=core_question,
         school_label=_SCHOOL_LABEL.get(school_id, school_id),
         titles=titles_blob,
@@ -576,8 +780,8 @@ def _pick_fatwas(
             model=settings.chat_model,
             response_format={"type": "json_object"},
             temperature=0,
-            max_tokens=200,
-            timeout=12,
+            max_tokens=500,
+            timeout=25,
             messages=[
                 {"role": "system", "content": _PICK_FATWA_SYSTEM},
                 {"role": "user",   "content": user_msg},
@@ -613,17 +817,100 @@ def _pick_fatwas(
     if ranked:
         return ranked
 
-    # Final fallback: if the LLM refused but we DID pre-rank by keyword
-    # overlap, the top-N candidates are almost certainly relevant. Better
-    # than returning nothing for the user.
-    if query_keywords and candidates:
+    # The model may explicitly say nothing matches — respect that.  The
+    # old "keyword fallback" kept returning the top substring hits even
+    # when the whole list was the wrong *branch*, which is what the user
+    # saw as irrelevant fatawa.
+    rids = parsed.get("ranked_fatwa_ids")
+    if isinstance(rids, list) and not rids:
+        return []
+
+    # Network / shape errors only: salvage first hits if the LLM hiccuped
+    if query_keywords and candidates and rids is None:
         logger.warning(
-            "[%s] Step B LLM returned no usable ids (parsed=%s); "
-            "falling back to top %d keyword-ranked candidates",
-            school_id, parsed, top_n,
+            "[%s] Step B parse missing ranked_fatwa_ids (parsed=%s) — last-resort"
+            " keyword top-%d (may be weak if tree branch was wrong)",
+            school_id, list(parsed.keys()) if isinstance(parsed, dict) else "?", top_n,
         )
         return [fid_to_cid[c["fid"]] for c in candidates[:top_n]]
     return []
+
+
+_REFINER_SYS = (
+    "You are an Urdu fiqh expert. Return ONLY JSON. No commentary."
+)
+_REFINER_USER = (
+    "User (original phrasing): {raw}\n\n"
+    "Standard line: {q}\n\n"
+    "Below are {n} fatawa candidates in **current** order. Each has an id"
+    " and the masʾala (question) text.\n"
+    "{blocks}\n\n"
+    "Task: output a JSON object with key \"order\" — a list of the **ids**"
+    " 1 to {n} in **best-first** order for answering the user (most relevant"
+    " first). Every id 1..{n} must appear exactly once. "
+    'Return: {{"order": [1, 3, 2, ...]}}'
+)
+
+
+def _refine_cid_order(
+    school_id: str,
+    user_q: str,
+    cids: list[str],
+    top_n: int,
+    user_raw: str = "",
+) -> list[str]:
+    """Second LLM pass: re-order a short list of composite ids by meaning."""
+    s = get_settings()
+    if not s.pageindex_refiner_enabled or len(cids) <= 1:
+        return cids[:top_n]
+    n = min(len(cids), s.pageindex_refiner_max)
+    cids = cids[:n]
+    lookup = _load_lookup()
+    blocks: list[str] = []
+    for i, cid in enumerate(cids, 1):
+        rec = lookup.get(cid) or {}
+        qv = (
+            (rec.get("question_text") or rec.get("query_text") or "")
+            .replace("\n", " ")[:420]
+        ) or "—"
+        blocks.append(f"#{i}  id={i}\nQ: {qv}")
+
+    try:
+        comp = _client().chat.completions.create(
+            model=s.chat_model,
+            response_format={"type": "json_object"},
+            temperature=0,
+            max_tokens=200,
+            timeout=20,
+            messages=[
+                {"role": "system", "content": _REFINER_SYS},
+                {
+                    "role": "user",
+                    "content": _REFINER_USER.format(
+                        raw=(user_raw or user_q)[:2000],
+                        q=user_q,
+                        n=n,
+                        blocks="\n\n".join(blocks),
+                    )[:12000],
+                },
+            ],
+        )
+        data = json.loads(comp.choices[0].message.content or "{}")
+        order = data.get("order")
+        if not isinstance(order, list) or len(order) != n:
+            raise ValueError("bad order")
+        seen: set[int] = set()
+        out: list[str] = []
+        for x in order:
+            j = int(x)
+            if j < 1 or j > n or j in seen:
+                raise ValueError("invalid perm")
+            seen.add(j)
+            out.append(cids[j - 1])
+        return out[:top_n]
+    except Exception as exc:
+        logger.warning("[%s] refiner failed (%s); keeping Step B order", school_id, exc)
+        return cids[:top_n]
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -726,6 +1013,7 @@ def navigate_school(
     category_hint: str | None,
     keywords: list[str] | None = None,
     top_n: int = _DEFAULT_TOP_N_PER_SCHOOL,
+    user_raw_query: str = "",
 ) -> dict:
     """Run the 2-step LLM descent for one school.
 
@@ -741,19 +1029,26 @@ def navigate_school(
     if not school_node:
         return _empty_school_result(school_id, "school subtree missing")
 
+    uq = (user_raw_query or "").strip()
+    tight_kw = _tight_scoring_tokens(core_question, keywords, uq)
     kw = keywords or _question_words(core_question)
     nav_trace: dict[str, Any] = {"llm_reranked": True}
 
-    # ── Category-hint shortcut ────────────────────────────────────────
-    # If the extract step returned a confident category_hint (e.g.
-    # "NAMAZ") and that category exists in this school, skip Step A
-    # entirely and go straight to its topics. This saves 1 LLM call
-    # for ~60% of queries.
+    # ── Category-hint shortcut (OFF by default — see settings) ─────────
+    # When ON: a single wrong ``category_hint`` used to search *all*
+    # fatawa under a huge folder, then lexical scoring picked spurious
+    # matches from the wrong branch.
     topic_nodes: list[dict] = []
-
-    if category_hint and category_hint.upper() != "OTHER":
+    s_cfg = get_settings()
+    if (
+        s_cfg.pageindex_category_hint_shortcut
+        and category_hint
+        and category_hint.upper() != "OTHER"
+    ):
         for cat in school_node.get("nodes", []) or []:
-            if cat.get("title", "").upper() == category_hint.upper():
+            if _cat_title_matches_hint(
+                (cat.get("title") or ""), category_hint
+            ):
                 topic_nodes = cat.get("nodes") or []
                 nav_trace["hint_shortcut"] = category_hint
                 logger.info("[%s] Hint shortcut → %s (%d children)",
@@ -763,7 +1058,7 @@ def navigate_school(
     # ── Step A: pick categories + topics/super-groups ─────────────────
     if not topic_nodes:
         pick_a = _pick_categories_and_topics(
-            school_id, school_node, core_question, category_hint
+            school_id, school_node, core_question, category_hint, user_raw=uq
         )
         nav_trace["category_node_ids"] = pick_a["category_node_ids"]
         nav_trace["topic_node_ids"] = pick_a["topic_node_ids"]
@@ -782,7 +1077,9 @@ def navigate_school(
     resolved_topic_nodes: list[dict] = []
     for tn in topic_nodes:
         if _is_supergroup_node(tn):
-            subs = _pick_subtopics_within_group(school_id, tn, core_question)
+            subs = _pick_subtopics_within_group(
+                school_id, tn, core_question, user_raw=uq
+            )
             resolved_topic_nodes.extend(subs)
             nav_trace["step_a5_drilled"] = tn.get("title", "")
         else:
@@ -792,15 +1089,29 @@ def navigate_school(
         return _empty_school_result(school_id, "no subtopics resolved")
 
     # ── Step B: LLM re-rank fatwa candidates ──────────────────────────
+    pre_score_kw = tight_kw if tight_kw else kw
     chosen_cids = _pick_fatwas(
         school_id, core_question, resolved_topic_nodes,
-        query_keywords=kw, top_n=top_n,
+        query_keywords=pre_score_kw, top_n=top_n, user_raw=uq,
     )
     if not chosen_cids:
         return _empty_school_result(school_id, "no fatwas picked")
 
+    pre_refine = list(chosen_cids)
+    chosen_cids = _refine_cid_order(
+        school_id, core_question, chosen_cids, top_n, user_raw=uq
+    )
+    if (
+        get_settings().pageindex_refiner_enabled
+        and len(pre_refine) > 1
+        and chosen_cids
+    ):
+        nav_trace["llm_refiner_pass2"] = True
+
     lookup = _load_lookup()
-    qwords = _question_words(core_question)
+    qwords = _urdu_scoring_tokens(
+        f"{(uq or '')} {(core_question or '')}", cap=24
+    ) or _question_words(core_question)
     total = len(chosen_cids)
     # Dedupe by content (same fatwa cross-listed under multiple subtopics
     # gets different composite IDs but identical text).
@@ -848,6 +1159,8 @@ def navigate_school(
 # ──────────────────────────────────────────────────────────────────────────
 
 _NAV_CACHE: dict[tuple, str] = {}
+# Increment when navigation / scoring logic changes (invalidates old cache).
+_NAV_CACHE_BUMP: int = 5
 
 
 def _cached_navigate_school(
@@ -856,13 +1169,17 @@ def _cached_navigate_school(
     category_hint: str | None,
     keywords_tuple: tuple[str, ...] = (),
     top_n: int = _DEFAULT_TOP_N_PER_SCHOOL,
+    user_raw: str = "",
 ) -> str:
     """Cached wrapper that only caches SUCCESSFUL results.
 
     Failed results (empty ``fatawa`` list) are NOT cached, so a
     transient LLM timeout doesn't permanently poison the query.
     """
-    key = (school_id, core_question, category_hint, keywords_tuple, top_n)
+    key = (
+        _NAV_CACHE_BUMP, school_id, core_question, category_hint,
+        keywords_tuple, top_n, user_raw,
+    )
     if key in _NAV_CACHE:
         return _NAV_CACHE[key]
 
@@ -870,6 +1187,7 @@ def _cached_navigate_school(
         school_id, core_question, category_hint,
         keywords=list(keywords_tuple) or None,
         top_n=top_n,
+        user_raw_query=user_raw,
     )
     result_json = json.dumps(result, ensure_ascii=False)
 
@@ -889,6 +1207,7 @@ def pageindex_search(
     *,
     category_hint: str | None = None,
     keywords: list[str] | None = None,
+    user_raw_query: str = "",
     schools: list[str] | None = None,
     top_n: int = _DEFAULT_TOP_N_PER_SCHOOL,
 ) -> list[dict]:
@@ -905,6 +1224,7 @@ def pageindex_search(
     _load_lookup()
 
     kw_tuple = tuple(keywords or ())
+    urq = (user_raw_query or "").strip()
 
     results: dict[str, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(
@@ -914,7 +1234,8 @@ def pageindex_search(
             ex.submit(
                 lambda sid=sid: json.loads(
                     _cached_navigate_school(
-                        sid, core_question, category_hint, kw_tuple, top_n
+                        sid, core_question, category_hint, kw_tuple, top_n,
+                        urq,
                     )
                 )
             ): sid

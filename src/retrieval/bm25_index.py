@@ -50,19 +50,23 @@ _TOKEN_RE = re.compile(
 
 
 def _tokenize(text: str) -> list[str]:
-    """Full tokenize with normalisation (used at query time — small text)."""
+    """Urdu-aware tokenize with normalisation (build + query)."""
     tokens = _TOKEN_RE.findall(normalize_urdu(text))
     return [t for t in tokens if len(t) > 1]
 
 
 def _tokenize_fast(text: str) -> list[str]:
-    """Fast tokenize for bulk corpus building — skip normalize_urdu().
+    """Fast Urdu-aware tokenize for bulk corpus building.
 
-    Uses simple split() + length filter. BM25 ranking is robust to minor
-    tokenisation differences; accuracy-critical normalisation only matters
-    at query time where we still use the full _tokenize().
+    Skips heavy normalisation but keeps the Arabic-script-aware regex so we
+    don't fall back to whitespace splitting (which loses Urdu words attached
+    to punctuation).
     """
-    return [w for w in text.split() if len(w) > 1]
+    return [t for t in _TOKEN_RE.findall(text) if len(t) > 1]
+
+
+def _bulk_tokenize(texts: list[str]) -> list[list[str]]:
+    return [_tokenize_fast(t) for t in texts]
 
 
 # ── BM25Corpus ───────────────────────────────────────────────────────────────
@@ -102,20 +106,20 @@ class BM25Corpus:
         """
         logger.info("Building bm25s index over %d documents…", len(docs))
 
-        # ── Full-text index (question + answer) ───────────────────────────
+        # ── Full-text index (question + answer) — Urdu-aware tokens ──────
         full_texts = [d.get("text", "") for d in docs]
-        full_tokens = bm25s.tokenize(full_texts, stopwords=None, show_progress=False)
+        full_tokens = _bulk_tokenize(full_texts)
         bm25 = bm25s.BM25()
         bm25.index(full_tokens, show_progress=False)
 
-        # ── Question-only index ───────────────────────────────────────────
+        # ── Question-only index — Urdu-aware tokens ──────────────────────
         q_texts = [
             d.get("question", "") or d.get("text", "")[:300]
             for d in docs
         ]
         bm25_questions = None
         if q_texts:
-            q_tokens = bm25s.tokenize(q_texts, stopwords=None, show_progress=False)
+            q_tokens = _bulk_tokenize(q_texts)
             bm25_questions = bm25s.BM25()
             bm25_questions.index(q_tokens, show_progress=False)
 
@@ -156,12 +160,14 @@ class BM25Corpus:
         conn.execute("PRAGMA journal_mode=WAL")
         cursor = conn.execute("SELECT id, metadata FROM embeddings")
 
+        from src.preprocessing.chunker import get_source_maslak  # lazy import
         docs: list[dict] = []
         for row_id, meta_json in cursor:
             meta = json.loads(meta_json) if meta_json else {}
             question = meta.get("question", "")
             answer = meta.get("answer", "")
             text = meta.get("text", "") or f"سوال: {question} جواب: {answer}"
+            folder = meta.get("folder", "")
             docs.append({
                 "id":          row_id,
                 "text":        text,
@@ -169,6 +175,9 @@ class BM25Corpus:
                 "answer":      answer,
                 "category":    meta.get("category", ""),
                 "source_file": meta.get("source_file", ""),
+                "folder":      folder,
+                "source_name": meta.get("source_name", ""),
+                "maslak":      meta.get("maslak") or get_source_maslak(folder),
             })
         conn.close()
         logger.info("Loaded %d docs from checkpoint for BM25 build.", len(docs))
@@ -291,7 +300,7 @@ class BM25Corpus:
             return []
 
         try:
-            query_tokens = bm25s.tokenize(query, stopwords=None, show_progress=False)
+            query_tokens = [_tokenize(query)]
             doc_ids, scores = self._bm25.retrieve(
                 query_tokens, k=k, show_progress=False
             )
@@ -314,6 +323,12 @@ class BM25Corpus:
                         "answer":      doc.get("answer", ""),
                         "category":    doc.get("category", ""),
                         "source_file": doc.get("source_file", ""),
+                        "folder":      doc.get("folder", ""),
+                        "source_name": doc.get("source_name", ""),
+                        "maslak":      doc.get("maslak", ""),
+                        "scholar":     doc.get("scholar", ""),
+                        "language":    doc.get("language", ""),
+                        "corpus_source": doc.get("corpus_source", ""),
                     },
                 }
             )
@@ -353,7 +368,7 @@ class BM25Corpus:
             return {}
 
         try:
-            query_tokens = bm25s.tokenize(query, stopwords=None, show_progress=False)
+            query_tokens = [_tokenize(query)]
             doc_ids, scores = self._bm25_questions.retrieve(
                 query_tokens, k=k, show_progress=False
             )

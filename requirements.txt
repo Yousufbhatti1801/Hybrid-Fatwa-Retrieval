@@ -1,14 +1,21 @@
 # Core
 openai>=1.30.0
-pinecone>=4.0.0
+pinecone>=4.0.0,<6.0.0
 pydantic-settings>=2.2.0
 python-dotenv>=1.0.0
 
 # Data
 pandas>=2.2.0
+numpy>=1.26.0
 
 # Retrieval
-rank-bm25>=0.2.2
+# bm25s is the active sparse-retrieval backend (numpy-vectorised, ~5-10x faster
+# than the legacy rank-bm25 which is no longer imported anywhere).
+bm25s>=0.2.0
+
+# Web frontend
+flask>=3.0.0
+flask-cors>=4.0.0
 
 # Utilities
 tqdm>=4.66.0

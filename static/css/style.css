@@ -786,6 +786,41 @@ body {
   direction: ltr;
 }
 
+/* ── Source Q&A blocks (retrieved fatwa question + full fatwa text) ───────── */
+.src-qa-block {
+  margin: 8px 0;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.02);
+  border-left: 3px solid var(--border);
+  border-radius: 4px;
+}
+
+.src-qa-label {
+  display: inline-block;
+  font-family: var(--font-ur);
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--accent, #2d6a4f);
+  margin-bottom: 4px;
+  letter-spacing: 0.02em;
+}
+
+.src-qa-text {
+  font-family: var(--font-ur);
+  font-size: 0.9rem;
+  color: var(--text-pri);
+  line-height: 1.9;
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.src-qa-answer {
+  max-height: 280px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
 /* ── Scrollbar global ────────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -855,6 +890,28 @@ body {
 .pi-section-school[data-school="fatwaqa"]   { --pi-accent: #d97706; --pi-accent-soft: #fef3c7; --pi-accent-deep: #854d0e; }
 .pi-section-school[data-school="IslamQA"]   { --pi-accent: #d97706; --pi-accent-soft: #fef3c7; --pi-accent-deep: #854d0e; }
 .pi-section-school[data-school="urdufatwa"] { --pi-accent: #7c3aed; --pi-accent-soft: #ede9fe; --pi-accent-deep: #5b21b6; }
+
+/* Hybrid RAG: same card chrome, three sects (deobandi / barelvi / ahle_hadith) */
+.pi-section-school[data-sect="deobandi"]    { --pi-accent: #2563eb; --pi-accent-soft: #dbeafe; --pi-accent-deep: #1e3a8a; }
+.pi-section-school[data-sect="barelvi"]     { --pi-accent: #7c3aed; --pi-accent-soft: #ede9fe; --pi-accent-deep: #5b21b6; }
+.pi-section-school[data-sect="ahle_hadith"] { --pi-accent: #d97706; --pi-accent-soft: #fef3c7; --pi-accent-deep: #854d0e; }
+
+.pi-results-note {
+  padding: 10px 16px 0;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+}
+.pi-results-note .answer-interp { margin: 0; font-size: 0.88rem; }
+
+.pi-hybrid-answer { margin-top: 4px; }
+.pi-hybrid-answer-txt {
+  margin: 8px 0 0;
+  font-family: var(--font-ur);
+  font-size: 0.95rem;
+  line-height: 1.75;
+  color: var(--text-pri);
+  white-space: pre-wrap;
+}
 
 /* ── Results container ───────────────────────────────────────────────── */
 .pi-results {

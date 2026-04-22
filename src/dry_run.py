@@ -612,10 +612,15 @@ _PI_LABELS = {
 
 def _mock_pi_extract_core_question(raw_query: str, **_kw: Any) -> dict:
     """Deterministic stand-in for ``pipeline_pageindex.extract_core_question``."""
+    text = (raw_query or "").strip() or "test question"
+    keys = [w for w in text.split() if len(w) > 2][:5]
+    s_terms = (keys + keys) if keys else ["test", "نماز"]
     return {
-        "core_question":     (raw_query or "").strip() or "test question",
+        "core_question":     text,
+        "normalized_urdu":  text,
         "category_hint":     "OTHER",
-        "keywords":          [w for w in (raw_query or "").split() if len(w) > 2][:5],
+        "keywords":          keys,
+        "search_terms":      s_terms,
         "schools_to_search": list(_PI_SCHOOLS),
     }
 

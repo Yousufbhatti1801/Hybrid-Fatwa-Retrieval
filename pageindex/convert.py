@@ -66,6 +66,60 @@ _FOLDER_TO_SCHOOL_ID = {
     "urdufatwa-ExtractedData-Output": "urdufatwa",
 }
 
+# Short bilingual glosses for corpus **folder** category names. The LLM
+# in PageIndex step A only sees the compact tree: glossed H3 lines make
+# it easier to match Urdu user questions to opaque English directory codes.
+# Keys are normalised to upper-case; unknown categories pass through.
+_CATEGORY_GLOSS: dict[str, str] = {
+    "OTHER": "دیگر / متفرق — Miscellaneous",
+    "NAMAZ": "نماز — Salah / prayer",
+    "NAMAAZ": "نماز — Salah / prayer",
+    "SALAH": "نماز — Salah / prayer",
+    "DIVORCE": "طلااق و نکاح — Marriage & divorce",
+    "MARRIAGE": "نکاح و رشتہ — Nikāḥ & family law",
+    "FAMILY": "خاندان — Family",
+    "TALAAQ": "طلااق — Ṭalāq",
+    "TALAQ": "طلااق — Ṭalāq",
+    "KHANDAN": "خاندان / ازدواج — Family & kinship",
+    "WOMEN": "عورت / خواتین — Women",
+    "AURAT": "خواتین — Women",
+    "MEN": "عمومی / مرد — General",
+    "ZAKAT": "زکوٰۃ — Zakāt",
+    "ZAKAH": "زکوٰۃ — Zakāt",
+    "HAJJ": "حج — Ḥajj & ʿUmrah",
+    "UMRAH": "عمرۃ — ʿUmrah",
+    "ROZA": "صوم / روزہ — Fasting",
+    "SAWM": "صوم / روزہ — Fasting",
+    "WUDU": "وضو — Wuḍūʾ & ablution",
+    "TAHARAH": "طہارت — Purity (ṭahārah)",
+    "TAHAARAT": "طہارت — Purity (ṭahārah)",
+    "TAHERAT": "طہارت — Purity (ṭahārah)",
+    "HADITH": "حدیث — Ḥadīth",
+    "QURAN": "قرآن — Qurʾān",
+    "HIFZ": "حفظ / قرات — Qurʾān & Ḥifẓ",
+    "BUSINESS": "معاملات / تجارت — Business & trade",
+    "TRADE": "لین دین / تجارت — Muʿāmalāt",
+    "INHERITANCE": "میراث / وراثت — Inheritance",
+    "JIHAD": "جہاد / امن — Jihād & conflict",
+    "JINAYAAT": "جرائم / حدود — Crimes & penalties",
+    "MEDICAL": "طب / حلیت / حرج — Medicine & health",
+    "FOOD": "حل / حرام غذا — Food & diet",
+    "ANIMALS": "ذبح / حلال جانور — Slaughter & animals",
+    "EDUCATION": "تعلیم / رشتہ — Education",
+    "SOCIAL": "ایک دوسرے کے حقوق — Social & ethics",
+    "DUA": "دعا / اذ کار — Supplication & dhikr",
+    "DREAMS": "رؤیا / تابیر — Dreams",
+    "GOLD": "نقد / مال — Gold, silver & money",
+    "BANK": "سود / قرض / بینک — Banking & loans",
+    "COURT": "قانون / اختلاف — Courts & oaths",
+    "POLITICS": "ریاست / سفر — State & travel",
+    "FASHION": "لباس / ستر — Dress & awrah",
+    "BIRTH": "ولادت / عقیقۃ / ختنۃ — Birth rites",
+    "DEATH": "جنازۃ / قبر / میراث — Death & estate",
+    "FARD": "فرایض / واجبات — Obligations",
+    "EID": "عید — Eids & times",
+    "FARD_HAJJ": "عمرۃ/حج الوداع — ʿUmra & farḍ",
+}
 
 # ──────────────────────────────────────────────────────────────────────────
 # Super-group clustering for large categories (especially OTHER)
@@ -280,6 +334,32 @@ def _clean_title(text: str, fallback: str = "—") -> str:
     return text[:200] or fallback
 
 
+def _category_h3_text(category: str) -> str:
+    """H3 line: ``CODE — Urdu/English gloss`` when known, else ``CODE``."""
+    raw = (category or "OTHER").strip() or "OTHER"
+    key = raw.upper().replace(" ", "_")
+    gloss = _CATEGORY_GLOSS.get(key, "")
+    if gloss:
+        return f"{raw} — {gloss}"
+    return _clean_title(raw)
+
+
+def _leaf_line_for_tree(fw: dict) -> str:
+    """One fatwa's markdown heading: question text, not only reference no."""
+    qn = (fw.get("question") or "").strip()
+    rq = (fw.get("query") or "").strip()
+    ref = (fw.get("fatwa_no") or "").strip()
+    if qn:
+        body = qn
+    elif rq and rq != ref:
+        body = rq
+    else:
+        body = ref
+    if not body:
+        body = "—"
+    return _clean_title(body)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Composite ID
 # ──────────────────────────────────────────────────────────────────────────
@@ -369,7 +449,8 @@ def convert(
         grouped[school_id][category][subtopic].append({
             "id":       cid,
             "fatwa_no": fatwa_no,
-            "question": rec.get("question", "")[:160],
+            "query":    (rec.get("query") or "")[:200],
+            "question": (rec.get("question") or "")[:500],
         })
         counts[school_id] += 1
 
@@ -381,15 +462,15 @@ def convert(
     # ── Write the markdown tree ──────────────────────────────────────────
     # For clustered categories (e.g. OTHER), we insert an extra H4
     # "super-group" level:
-    #   ### OTHER                          (H3 = category)
+    #   ### OTHER — …gloss                 (H3 = category + bilingual hint)
     #   #### مالی معاملات — Financial      (H4 = super-group, NEW)
     #   ##### muamlat                      (H5 = subtopic, was H4)
-    #   ###### بینک سے قرض لینے کا حکم    (H6 = fatwa, was H5)
+    #   ###### <Urdu question snippet>     (H6 = fatwa, was H5; text not ref no.)
     #
     # For non-clustered categories the hierarchy stays at 3 levels:
-    #   ### DIVORCE                        (H3 = category)
+    #   ### NAMAZ — نماز…                  (H3 = category)
     #   #### talaaq                        (H4 = subtopic)
-    #   ##### fatwa title                  (H5 = fatwa)
+    #   ##### <question text>              (H5 = fatwa)
     # ── Load subgroup cache (if available) ─────────────────────────────
     sg_cache: dict = {}
     if SUBGROUP_CACHE_PATH.exists():
@@ -424,16 +505,16 @@ def convert(
             # No sub-groups — write the subtopic heading then fatwas flat
             f.write(f"{heading_prefix} {_clean_title(subtopic)}\n\n")
             for fw in sorted(fatwas, key=lambda x: x["fatwa_no"]):
-                title = _clean_title(fw["fatwa_no"])
-                f.write(f"{fatwa_prefix} {title}\n")
+                line = _leaf_line_for_tree(fw)
+                f.write(f"{fatwa_prefix} {line}\n")
                 f.write(f"<!-- id:{fw['id']} -->\n\n")
             return
 
-        # Split fatwas into sub-groups
+        # Split fatwas into sub-groups (keyword-match on real question text)
         groups = entry["groups"]
         buckets: list[list[dict]] = [[] for _ in groups]
         for fw in fatwas:
-            idx = assign_fatwa_to_group(fw["fatwa_no"], groups)
+            idx = assign_fatwa_to_group(_leaf_line_for_tree(fw), groups)
             buckets[idx].append(fw)
 
         for gi, group in enumerate(groups):
@@ -443,8 +524,8 @@ def convert(
             label = f"{subtopic} — {group['name_ur']} — {group['name_en']}"
             f.write(f"{heading_prefix} {_clean_title(label)}\n\n")
             for fw in sorted(bucket, key=lambda x: x["fatwa_no"]):
-                title = _clean_title(fw["fatwa_no"])
-                f.write(f"{fatwa_prefix} {title}\n")
+                line = _leaf_line_for_tree(fw)
+                f.write(f"{fatwa_prefix} {line}\n")
                 f.write(f"<!-- id:{fw['id']} -->\n\n")
 
     logger.info("Writing markdown tree → %s", md_path)
@@ -459,7 +540,7 @@ def convert(
             f.write(f"## {_clean_title(_school_label(folder), school_id)}\n\n")
 
             for category in sorted(grouped[school_id].keys()):
-                f.write(f"### {_clean_title(category)}\n\n")
+                f.write(f"### {_category_h3_text(category)}\n\n")
 
                 # Check if this category should be clustered (super-groups)
                 subtopics = grouped[school_id][category]

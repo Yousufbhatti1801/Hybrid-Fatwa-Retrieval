@@ -102,6 +102,85 @@ from src.pipeline.prompt_builder import NO_ANSWER_SENTINEL
 from src.pipeline.output_validator import validate as ov_validate
 from src.preprocessing.urdu_normalizer import normalize_urdu
 
+# ── Islam360 retriever (new corpus) ───────────────────────────────────────────
+# In this build the active Pinecone index is `islam360-fatwa-1536` and the
+# legacy 4-school index (`fatawa-hybrid`) is not present in the project.
+# We route the main /api/query endpoint through the Islam360 hybrid pipeline
+# (dense + BM25 + RRF + LLM rerank).  The retriever is created lazily so
+# that --dry-run still works without API keys.
+_islam360_retriever = None
+
+def _get_islam360_retriever():
+    global _islam360_retriever
+    if _islam360_retriever is None:
+        from src.islam360.retrieve import Islam360Retriever
+        _islam360_retriever = Islam360Retriever()
+        log.info("Islam360 retriever initialised (index=islam360-fatwa-1536)")
+    return _islam360_retriever
+
+
+def _islam360_query_for_flask(
+    question: str,
+    *,
+    top_k: int,
+    maslak: str | None = None,  # accepted for API compat; not used
+    category: str | None = None,  # accepted for API compat; not used
+):
+    """Bridge the Islam360 retriever to the shape Flask expects.
+
+    Returns ``(answer, sources, blocked, guard_hits, num_chunks)`` so the
+    rest of /api/query can stay unchanged.
+
+    Sources are normalised so each item exposes ``metadata`` (with
+    ``question``/``answer``/etc.) and ``score`` — matching the legacy
+    pipeline's source format used by the JSON serialiser below.
+    """
+    retr = _get_islam360_retriever()
+    # NOTE: ``retrieve()`` dispatches to retrieve_fast() by default
+    # (BM25-first, no LLM rewrite/rerank) — the simple, fast pipeline that
+    # matches the original working setup. It also auto-detects a sect in
+    # the query (``"deobandi ka fatwa"``, ``"barelvi kehte hain"``) and
+    # scopes the retrieval to that sect's source allow-list.
+    # ``maslak`` (from the UI maslak dropdown) is the explicit override.
+    from src.islam360.url_index import SECT_TO_SOURCES
+
+    # Map legacy maslak UI values onto the canonical sect codes so an
+    # explicit selection wins over auto-detection.
+    MASLAK_TO_SECT: dict[str, str] = {
+        "deobandi":     "deobandi",
+        "barelvi":      "barelvi",
+        "ahle_hadith":  "ahle_hadith",
+        "ahle_hadees":  "ahle_hadith",
+        "ahle hadees":  "ahle_hadith",
+        "ahle hadith":  "ahle_hadith",
+    }
+    sect_override: str | None = None
+    if maslak:
+        sect_override = MASLAK_TO_SECT.get(maslak.strip().lower())
+    if sect_override is not None and sect_override in SECT_TO_SOURCES:
+        out = retr.retrieve_by_sect(question, sect_override, top_k=top_k)
+    else:
+        out = retr.retrieve(question, top_k=top_k)
+
+    raw_sources = out.get("sources") or []
+    sources: list[dict] = []
+    for s in raw_sources:
+        meta = dict(s.get("metadata") or {})
+        # Make sure required display fields exist for the UI card.
+        meta.setdefault("source_name", meta.get("scholar") or "Islam360")
+        meta.setdefault("source_file", meta.get("source_file", ""))
+        meta.setdefault("category", meta.get("category", "—"))
+        meta.setdefault("maslak", meta.get("maslak", ""))
+        sources.append({
+            "id":       s.get("id"),
+            "score":    float(s.get("final_score", s.get("rerank_score", 0.0))),
+            "metadata": meta,
+        })
+
+    answer = out.get("answer") or NO_ANSWER_SENTINEL
+    no_match = bool(out.get("no_match"))
+    return answer, sources, no_match, [], len(sources)
+
 # PageIndex (vectorless) retrieval — second mode toggleable from the UI
 from pageindex.client import PageIndexClient
 _pi_client = PageIndexClient()
@@ -488,33 +567,22 @@ def api_query():
 
     t0 = time.perf_counter()
     try:
-        if use_grd:
-            gr = guarded_query(
-                urdu_q,
-                retrieval_query=retrieval_q,
-                config=_guard_cfg,
+        # NOTE: We pass the RAW user question (not the legacy-preprocessed
+        # ``urdu_q``) to the Islam360 retriever.  The legacy
+        # ``_preprocess_query`` was tuned for a different corpus and its
+        # synonym expansion drifts the query away from Islam360's wording.
+        # Islam360 has its own purpose-built LLM rewriter that handles
+        # Urdu, English, and roman-Urdu natively — feeding it the raw
+        # question gives dramatically better retrieval than feeding it
+        # twice-translated text.
+        answer, sources, blocked, guard_hits, num_chunks = (
+            _islam360_query_for_flask(
+                question,
                 top_k=effective_top_k,
                 category=cat_filter,
                 maslak=maslak_filter,
             )
-            answer       = gr.answer
-            sources      = gr.sources
-            blocked      = not gr.passed
-            guard_hits   = gr.guardrail_hits
-            num_chunks   = gr.num_chunks
-        else:
-            result       = rag_query(
-                urdu_q,
-                retrieval_query=retrieval_q,
-                top_k=effective_top_k,
-                category=cat_filter,
-                maslak=maslak_filter,
-            )
-            answer       = result["answer"]
-            sources      = result.get("sources", [])
-            blocked      = False
-            guard_hits   = []
-            num_chunks   = result.get("num_chunks", len(sources))
+        )
 
         if (answer or "").strip() == NO_ANSWER_SENTINEL and sources:
             recovered = _recover_answer_from_sources(urdu_q, sources, maslak_filter)
@@ -577,11 +645,26 @@ def api_query():
                 "category":    meta.get("category", "—"),
                 "source_name": source_name,
                 "maslak":      meta.get("maslak", ""),
+                "sect":        meta.get("sect", ""),
+                "source":      meta.get("source", ""),
                 "source_file": meta.get("source_file", meta.get("source", "—")),
                 "reference":   reference_url,
                 "question":    meta.get("question", ""),
+                # Full fatwa answer text (truncated at 1500 chars for transport).
+                # The UI renders this verbatim so users can see exactly which
+                # fatwa drove the answer, not just its question title.
+                "answer":      str(meta.get("answer", meta.get("text", "")))[:1500],
                 "fatwa_no":    meta.get("fatwa_no", ""),
                 "score":       round(s.get("score", 0.0), 4) if isinstance(s, dict) else 0.0,
+                "anchor_hits": s.get("anchor_hits", 0) if isinstance(s, dict) else 0,
+                "rerank_score": (
+                    round(s.get("rerank_score", 0.0), 3)
+                    if isinstance(s, dict) and s.get("rerank_score") is not None
+                    else None
+                ),
+                "rerank_reason": (
+                    s.get("rerank_reason", "") if isinstance(s, dict) else ""
+                ),
             })
 
         payload = {
@@ -625,148 +708,152 @@ def _fmt_validation(report) -> dict | None:
 
 @app.route("/api/query-all-schools", methods=["POST"])
 def api_query_all_schools():
-    """Query all 3 schools of thought simultaneously, return one answer per maslak.
-    
-    Returns one answer per Islamic school:
-    - Banuri Institute (Deobandi)
-    - UrduFatwa (Barelvi)  
-    - IslamQA + FatwaQA (Ahle Hadees)
+    """Query each sect's source(s) independently and return three separate results.
+
+    Behaviour (per the sect-aware spec):
+
+    * Deobandi → retrieves ONLY from the Banuri source
+    * Barelvi  → retrieves ONLY from the UrduFatwa source
+    * Ahle Hadees → retrieves from IslamQA + FatwaQA only
+
+    Each sect is retrieved with its own strict source allow-list filter,
+    scored independently, and answered independently by the LLM using
+    **only** that sect's fatwas as context.  Results are NEVER merged
+    into a single ranked list — cross-sect contamination is considered
+    a hard error and logged accordingly.
     """
     import concurrent.futures
-    data     = request.get_json(force=True, silent=True) or {}
+
+    from src.islam360.retrieve import detect_sect_in_query
+    from src.islam360.url_index import (
+        ALL_SECTS,
+        SECT_AHLE_HADITH,
+        SECT_BARELVI,
+        SECT_DEOBANDI,
+    )
+
+    data = request.get_json(force=True, silent=True) or {}
     question = (data.get("question") or "").strip()
     category = (data.get("category") or "").strip().upper()
-    top_k    = int(data.get("top_k") or _args.top_k)
-    use_grd  = bool(data.get("guardrails", _args.guardrails))
-    validate  = bool(data.get("validate", True))
+    top_k = int(data.get("top_k") or _args.top_k)
     use_query_expansion = bool(data.get("expand_query", True))
-    
+
     if not question:
         return jsonify({"error": "سوال خالی ہے — Question is empty."}), 400
-    
-    cat_filter = None  # NOTE: category filtering disabled—metadata not properly indexed
+
     if use_query_expansion:
         urdu_q, retrieval_q = _preprocess_query(question)
     else:
         urdu_q, retrieval_q = question, question
-    q_terms = _query_terms(urdu_q)
     effective_top_k = max(top_k, 10) if _is_intimacy_query(urdu_q) else top_k
 
-    # Map maslak to school filter
-    SCHOOL_MASLAK = {
-        "Deobandi":   ("Deobandi", "Banuri Institute (Deobandi)"),
-        "Barelvi":    ("Barelvi", "UrduFatwa (Barelvi)"),
-        "Ahle Hadees": ("Ahle Hadees", "IslamQA + FatwaQA (Ahle Hadees)"),
+    # Human-readable labels for each sect card in the UI.
+    SECT_LABELS: dict[str, str] = {
+        SECT_DEOBANDI:    "Deobandi",
+        SECT_BARELVI:     "Barelvi",
+        SECT_AHLE_HADITH: "Ahle Hadees",
+    }
+    SECT_SOURCE_DESC: dict[str, str] = {
+        SECT_DEOBANDI:    "Banuri Institute",
+        SECT_BARELVI:     "UrduFatwa",
+        SECT_AHLE_HADITH: "IslamQA + FatwaQA",
     }
 
-    def query_one_school(maslak_name: str, maslak_filter: str):
-        """Query a single school of thought."""
-        t0 = time.perf_counter()
+    retr = _get_islam360_retriever()
 
-        def _run_once(rq: str):
-            if use_grd:
-                gr = guarded_query(
-                    urdu_q,
-                    retrieval_query=rq,
-                    config=_guard_cfg,
-                    top_k=effective_top_k,
-                    category=cat_filter,
-                    maslak=maslak_filter,
-                )
-                return gr.answer, gr.sources, gr.num_chunks
-            result = rag_query(
-                urdu_q,
-                retrieval_query=rq,
-                top_k=effective_top_k,
-                category=cat_filter,
-                maslak=maslak_filter,
+    t0 = time.perf_counter()
+
+    # Run the three retrievals in parallel — they're independent (each
+    # operates on a disjoint source allow-list) so there's no risk of
+    # cross-talk, and parallelism makes the 3× LLM-synthesis cost roughly
+    # 1× wall-clock.
+    def _run_sect(sect_code: str) -> dict:
+        return retr.retrieve_by_sect(question, sect_code, top_k=effective_top_k)
+
+    per_sect: dict[str, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futs = {pool.submit(_run_sect, s): s for s in ALL_SECTS}
+        for fut in concurrent.futures.as_completed(futs):
+            sect = futs[fut]
+            try:
+                per_sect[sect] = fut.result()
+            except Exception as exc:
+                log.exception("Sect %s retrieval failed: %s", sect, exc)
+                per_sect[sect] = {
+                    "answer": "(retrieval failed)",
+                    "sources": [],
+                    "no_match": True,
+                    "log": {"error": str(exc)},
+                }
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+    def _format_sources(raw_sources: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for s in (raw_sources or [])[:5]:
+            meta = s.get("metadata", s) if isinstance(s, dict) else {}
+            folder = meta.get("folder", "") or meta.get("source", "")
+            reference_url = (
+                meta.get("reference")
+                or meta.get("url")
+                or (meta.get("date") if str(meta.get("date", "")).startswith("http") else "")
             )
-            return result["answer"], result.get("sources", []), result.get("num_chunks", len(result.get("sources", [])))
+            source_name = (
+                meta.get("source_name")
+                or folder.replace("-ExtractedData-Output", "").strip()
+                or meta.get("source_file", "Islam360")
+            )
+            out.append({
+                "category":    meta.get("category", "—"),
+                "source_name": source_name,
+                "maslak":      meta.get("maslak", ""),
+                "sect":        meta.get("sect", ""),
+                "source":      meta.get("source", ""),
+                "source_file": meta.get("source_file", meta.get("source", "—")),
+                "reference":   reference_url,
+                "question":    meta.get("question", ""),
+                "answer":      str(meta.get("answer", meta.get("text", "")))[:1500],
+                "fatwa_no":    meta.get("fatwa_no", ""),
+                "score":       round(s.get("score", s.get("final_score", 0.0)), 4)
+                                    if isinstance(s, dict) else 0.0,
+                "anchor_hits": s.get("anchor_hits", 0) if isinstance(s, dict) else 0,
+                "rerank_score": (
+                    round(s.get("rerank_score", 0.0), 3)
+                    if isinstance(s, dict) and s.get("rerank_score") is not None
+                    else None
+                ),
+                "rerank_reason": (
+                    s.get("rerank_reason", "") if isinstance(s, dict) else ""
+                ),
+            })
+        return out
 
-        try:
-            answer, sources, num_chunks = _run_once(retrieval_q)
-
-            # If expanded retrieval drifts off-topic, retry once with the cleaner urdu query.
-            if use_query_expansion and retrieval_q != urdu_q and q_terms:
-                rel1 = _count_relevant_sources(sources, q_terms)
-                if rel1 == 0:
-                    ans2, src2, n2 = _run_once(urdu_q)
-                    rel2 = _count_relevant_sources(src2, q_terms)
-                    if rel2 >= rel1:
-                        answer, sources, num_chunks = ans2, src2, n2
-                        log.info("Fallback to plain urdu retrieval for %s (relevance %d -> %d)", maslak_name, rel1, rel2)
-
-            if (answer or "").strip() == NO_ANSWER_SENTINEL and sources:
-                recovered = _recover_answer_from_sources(urdu_q, sources, maslak_name)
-                if recovered and recovered.strip() != NO_ANSWER_SENTINEL:
-                    answer = recovered
-            
-            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
-            
-            clean_sources = []
-            for s in sources[:3]:
-                meta = s.get("metadata", s) if isinstance(s, dict) else {}
-                folder = meta.get("folder", "") or meta.get("source", "")
-                reference_url = (
-                    meta.get("reference")
-                    or meta.get("url")
-                    or (meta.get("date") if str(meta.get("date", "")).startswith("http") else "")
-                )
-                source_name = (
-                    meta.get("source_name")
-                    or folder.replace("-ExtractedData-Output", "").strip()
-                    or meta.get("source_file", "—")
-                )
-                clean_sources.append({
-                    "category":    meta.get("category", "—"),
-                    "source_name": source_name,
-                    "maslak":      meta.get("maslak", ""),
-                    "source_file": meta.get("source_file", meta.get("source", "—")),
-                    "reference":   reference_url,
-                    "question":    meta.get("question", "")[:120],
-                    "fatwa_no":    meta.get("fatwa_no", ""),
-                    "score":       round(s.get("score", 0.0), 4) if isinstance(s, dict) else 0.0,
-                })
-            
-            return {
-                "maslak": maslak_name,
-                "answer": answer,
-                "sources": clean_sources,
-                "num_chunks": num_chunks,
-                "elapsed_ms": elapsed_ms,
-            }
-        except Exception as exc:
-            log.exception("Query failed for %s: %s", maslak_name, exc)
-            return {
-                "maslak": maslak_name,
-                "answer": f"خرابی: {str(exc)}",
-                "sources": [],
-                "num_chunks": 0,
-                "elapsed_ms": 0,
-            }
-    
-    # Query all 3 schools in parallel
+    # Preserve the canonical order: Deobandi → Barelvi → Ahle Hadees.
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {
-            executor.submit(query_one_school, name, mslk): name
-            for name, (mslk, _) in SCHOOL_MASLAK.items()
-        }
-        for future in concurrent.futures.as_completed(futures):
-            results.append(future.result())
-    
-    # Sort by maslak order for consistency
-    results.sort(key=lambda r: list(SCHOOL_MASLAK.keys()).index(r["maslak"]))
-    
+    for sect in ALL_SECTS:
+        payload = per_sect.get(sect, {})
+        sources = _format_sources(payload.get("sources"))
+        results.append({
+            "maslak":       SECT_LABELS[sect],
+            "sect":         sect,
+            "source_label": SECT_SOURCE_DESC[sect],
+            "answer":       payload.get("answer") or "(no answer)",
+            "no_match":     bool(payload.get("no_match")),
+            "sources":      sources,
+            "num_chunks":   len(sources),
+            "elapsed_ms":   elapsed_ms if sect == ALL_SECTS[0] else 0,
+        })
+
     return jsonify({
-        "query": question,
+        "query":             question,
         "original_question": question,
-        "urdu_question": urdu_q,
-        "retrieval_query": retrieval_q,
-        "effective_top_k": effective_top_k,
-        "category": category if category and category != "ALL" else None,
-        "results": results,
-        "dry_run": _args.dry_run,
+        "urdu_question":     urdu_q,
+        "retrieval_query":   retrieval_q,
+        "effective_top_k":   effective_top_k,
+        "detected_sect":     detect_sect_in_query(question),
+        "category":          category if category and category != "ALL" else None,
+        "results":           results,
+        "dry_run":           _args.dry_run,
     })
 
 
@@ -856,6 +943,64 @@ def search_raw_fatwas():
     return jsonify(payload)
 
 
+# ── Smart router (/api/query-smart) ──────────────────────────────────────────
+#
+# Escalating three-stage retrieval:
+#
+#   1. raw-fatwas fast probe   (rerank=False, ~200-500 ms, keyword only)
+#   2. Islam360 retrieve_fast  (BM25 + strict LLM rerank, ~5-8 s)
+#   3. PageIndex tree descent  (LLM category navigation, ~3-5 s)
+#
+# The first stage that clears its confidence bar wins; the rest are
+# skipped.  See ``src/routing/router.py`` for the scoring functions
+# and escalation rules, and ``src/config/settings.py`` for thresholds.
+
+@app.route("/api/query-smart", methods=["POST"])
+def api_query_smart():
+    """Confidence-routed retrieval across raw-fatwas → Islam360 → PageIndex.
+
+    Request body mirrors ``/api/query-all-schools``:
+
+    .. code-block:: json
+
+       { "question": "...", "top_k": 5, "force_path": "raw_fatwas|islam360|pageindex|null" }
+
+    ``force_path`` is an escape-hatch for debugging / ablation — when
+    set, the router runs ONLY that stage regardless of confidence.
+
+    Response is the same three-sect shape as ``/api/query-all-schools``
+    PLUS a ``routing`` sub-object with the full escalation trace.
+    """
+    from src.routing import route_query
+
+    data = request.get_json(force=True, silent=True) or {}
+    question = (data.get("question") or "").strip()
+    top_k = int(data.get("top_k") or _args.top_k)
+    force_path = data.get("force_path")
+    if force_path not in (None, "", "raw_fatwas", "islam360", "pageindex"):
+        return jsonify({"error": f"invalid force_path={force_path!r}"}), 400
+    if not question:
+        return jsonify({"error": "سوال خالی ہے — Question is empty."}), 400
+
+    t0 = time.perf_counter()
+    try:
+        result = route_query(
+            question,
+            top_k=top_k,
+            retriever=_get_islam360_retriever(),
+            pi_client=_pi_client,
+            raw_client=_raw_client,
+            force_path=force_path or None,
+        )
+    except Exception as exc:
+        log.exception("smart-router failed")
+        return jsonify({"error": str(exc)}), 500
+
+    result["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    result["dry_run"] = _args.dry_run
+    return jsonify(result)
+
+
 @app.route("/api/health")
 def health():
     return jsonify({
@@ -920,6 +1065,15 @@ def _warmup():
         log.info("  ✓ OpenAI chat client cached")
     except Exception as exc:
         log.warning("  ✗ OpenAI chat warm-up skipped: %s", exc)
+
+    # Islam360 URL sidecar lookup (built once from raw CSVs, cached to disk)
+    if not _args.dry_run:
+        try:
+            from src.islam360.url_index import get_url_lookup
+            _url_map = get_url_lookup()
+            log.info("  ✓ Islam360 URL lookup ready (%d ids)", len(_url_map))
+        except Exception as exc:
+            log.warning("  ✗ Islam360 URL lookup skipped: %s", exc)
 
     # PageIndex tree + flat lookup (skipped silently if not yet built)
     try:

@@ -631,9 +631,9 @@ def guarded_query(
 ) -> GuardedResult:
     """Run the full RAG pipeline wrapped with all five guardrails.
 
-    This is the **recommended entry point** for production use.  It calls
-    :func:`src.pipeline.rag.query` internally and wraps the result with
-    safety checks.
+    This is the **recommended entry point** for production use.  It uses the
+    same hybrid retrieval + optional LLM re-rank as :func:`src.pipeline.rag.query`,
+    then applies guardrails around the LLM call.
 
     Parameters
     ----------
@@ -685,7 +685,7 @@ def guarded_query(
     from src.pipeline.context_trimmer import trim_to_budget  # noqa: PLC0415
     from src.pipeline.prompt_builder import build_messages   # noqa: PLC0415
     from src.preprocessing.urdu_normalizer import normalize_urdu  # noqa: PLC0415
-    from src.retrieval.hybrid_retriever import hybrid_search  # noqa: PLC0415
+    from src.pipeline.rag import retrieve_with_rerank  # noqa: PLC0415
 
     settings = get_settings()
     budget = context_token_budget or settings.context_token_budget
@@ -712,8 +712,9 @@ def guarded_query(
     retrieval_text = retrieval_query or question
     normalised = normalize_urdu(retrieval_text)
     try:
-        retrieved = hybrid_search(
+        retrieved = retrieve_with_rerank(
             normalised,
+            user_question=question,
             top_k=top_k,
             dense_weight=dense_weight,
             sparse_weight=sparse_weight,
@@ -757,7 +758,7 @@ def guarded_query(
         gr_elapsed = (time.perf_counter() - gr_t0) * 1000
         return GuardedResult(
             answer=cfg.sentinel,
-            sources=[r["metadata"] for r in retrieved],
+            sources=[{"score": r.get("score", 0.0), "metadata": r.get("metadata", r)} for r in retrieved],
             num_chunks=len(retrieved),
             passed=False,
             guardrail_hits=hits,
@@ -816,7 +817,7 @@ def guarded_query(
 
     return GuardedResult(
         answer=answer,
-        sources=[r["metadata"] for r in trimmed],
+        sources=[{"score": r.get("score", 0.0), "metadata": r.get("metadata", r)} for r in trimmed],
         num_chunks=len(trimmed),
         passed=True,
         guardrail_hits=hits,

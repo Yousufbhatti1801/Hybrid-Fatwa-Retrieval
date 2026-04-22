@@ -24,6 +24,7 @@ from openai import OpenAI                                # noqa: E402
 from src.config import get_settings                       # noqa: E402
 
 from pageindex.pipeline_pageindex import extract_core_question
+from pageindex.query_enrich import merge_pageindex_keywords
 from pageindex.search_pageindex import (
     pageindex_search,
     preload as _preload_search,
@@ -63,17 +64,40 @@ class PageIndexClient:
         """End-to-end search: returns the JSON shape that
         ``/api/search_pageindex`` will hand to the frontend.
         """
+        s = get_settings()
         extracted = extract_core_question(raw_question)
+        base_terms = (
+            extracted.get("search_terms")
+            or extracted.get("keywords")
+            or []
+        )
+        norm = (
+            (extracted.get("normalized_urdu") or "").strip()
+            or (extracted.get("core_question") or "").strip()
+        )
+        blob = "\n".join(
+            p for p in (norm, (raw_question or "").strip()) if p
+        )
+        merged = merge_pageindex_keywords(
+            base_terms,
+            blob,
+            apply_synonym_expansion=bool(
+                s.pageindex_lexical_synonym_expand
+            ),
+        )
+        nav_q = norm or extracted["core_question"]
         results = pageindex_search(
-            extracted["core_question"],
+            nav_q,
             category_hint=extracted.get("category_hint"),
-            keywords=extracted.get("keywords") or [],
+            keywords=merged,
+            user_raw_query=(raw_question or "").strip(),
         )
         return {
-            "query":        raw_question,
-            "search_query": extracted["core_question"],
-            "extracted":    extracted,
-            "results":      results,
+            "query":         raw_question,
+            "search_query":  nav_q,
+            "extracted":     extracted,
+            "keywords_merged": merged,
+            "results":       results,
         }
 
     def summarise(self, fatwa_id: str, *, model: str | None = None) -> dict:

@@ -351,6 +351,8 @@ def preprocess_record(
         "folder":        folder,
         # Human-readable source name for citations and UI display
         "source_name":   get_source_display_name(folder),
+        # School-of-thought tag for per-maslak filtering
+        "maslak":        record.get("maslak") or get_source_maslak(folder),
         "date":          record.get("date"),
         "reference":     record.get("reference"),
         "length_flag":   flag,

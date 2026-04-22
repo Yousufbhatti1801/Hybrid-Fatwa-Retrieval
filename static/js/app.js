@@ -4,7 +4,7 @@ const state = {
   history: [],
   isLoading: false,
   lastSources: [],
-  mode: 'hybrid',     // 'hybrid' | 'pageindex'
+  mode: 'hybrid',     // 'hybrid' | 'pageindex' only
 };
 
 /* ── DOM refs ──────────────────────────────────────────────────────────── */
@@ -104,9 +104,6 @@ async function sendQuestion() {
   if (state.mode === 'pageindex') {
     return doPISearch(q);
   }
-  if (state.mode === 'raw-fatwas') {
-    return doRawFatwasSearch(q);
-  }
 
   // Show typing indicator
   const typingId = appendTyping();
@@ -135,20 +132,7 @@ async function sendQuestion() {
       const results = Array.isArray(data.results) ? data.results : [];
 
       if (results.length) {
-        // One clearly-labeled answer card per sect
-        results.forEach(r => {
-          appendBotBubble({
-            answer: r.answer,
-            sources: r.sources || [],
-            blocked: false,
-            guard_hits: [],
-            num_chunks: r.num_chunks,
-            elapsed_ms: r.elapsed_ms,
-            validation: null,
-            dry_run: data.dry_run,
-            maslak: r.maslak,
-          });
-        });
+        renderHybridResults(data);
         addHistory(q);
       } else {
         // Fallback to original single-answer endpoint
@@ -271,6 +255,120 @@ function appendBotBubble(data) {
   messages.appendChild(el);
 }
 
+/* ── Hybrid /query-all-schools: same shell as PageIndex (stacked sects) ─── */
+function renderHybridResults(data) {
+  const results = Array.isArray(data.results) ? data.results : [];
+  const showInterp =
+    data.original_question &&
+    data.urdu_question &&
+    data.original_question.trim() !== data.urdu_question.trim();
+  const interpBlock = showInterp
+    ? `<div class="pi-results-note">
+         <p class="answer-interp"><em>تلاش بطور:</em> ${escHtml(data.urdu_question)}</p>
+       </div>`
+    : '';
+  const elapsed =
+    (results[0] && results[0].elapsed_ms) ??
+    data.elapsed_ms ??
+    '?';
+
+  const sections = results.map((r, i) => _hybridSectSection(r, i)).join('');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-bot';
+  wrap.innerHTML = `
+    <div class="pi-results pi-results--hybrid">
+      <div class="pi-results-header">
+        <span class="pi-results-icon">⚡</span>
+        <span class="pi-results-title">Hybrid RAG — تین مسالک</span>
+        <span class="pi-results-stats">
+          ⏱ ${elapsed} ms
+          ${data.dry_run ? ' · dry-run' : ''}
+        </span>
+      </div>
+      ${interpBlock}
+      ${sections}
+    </div>`;
+
+  results.forEach((r, i) => {
+    const sec = wrap.querySelector(`.pi-hybrid-section[data-idx="${i}"]`);
+    if (!sec) return;
+    const btn = sec.querySelector('button.sources-btn');
+    if (btn) {
+      btn.addEventListener('click', () => openModal(r.sources || []));
+    }
+  });
+
+  messages.appendChild(wrap);
+}
+
+function _hybridSectSection(r, idx) {
+  const bySect = {
+    deobandi:    { en: 'Banuri',     maslak: 'Deobandi',     maslakUr: 'دیوبندی' },
+    barelvi:     { en: 'UrduFatwa',  maslak: 'Barelvi',      maslakUr: 'بریلوی' },
+    ahle_hadith: { en: 'A.Hadees',   maslak: 'Ahle Hadees',  maslakUr: 'اہل حدیث' },
+  };
+  const lbl = bySect[r.sect] || {
+    en:         r.maslak || '—',
+    maslak:     r.maslak || '',
+    maslakUr:   '',
+  };
+  const label = (r.source_label && String(r.source_label)) || lbl.en;
+  const schoolLine = r.maslak
+    ? `${r.maslak}${lbl.maslakUr ? ' · ' + lbl.maslakUr : ''}`
+    : `${lbl.maslak}${lbl.maslakUr ? ' · ' + lbl.maslakUr : ''}`;
+
+  const initial = (lbl.en && lbl.en[0] ? lbl.en[0] : (label[0] || '?')).toUpperCase();
+  const nSrc = (r.sources && r.sources.length) || 0;
+  const bad = r.no_match || (r.answer && /^\(retrieval failed\)/i.test(String(r.answer)));
+  const hasAns =
+    r.answer && String(r.answer).trim() && r.answer !== '(no answer)';
+
+  if (bad && !hasAns) {
+    return `
+      <div class="pi-section-school pi-hybrid-section pi-section-school--empty" data-sect="${escHtml(r.sect)}" data-idx="${idx}">
+        <div class="pi-school-bar">
+          <div class="pi-school-avatar">${escHtml(initial)}</div>
+          <div class="pi-school-info">
+            <span class="pi-school-name">${escHtml(label)}</span>
+            <span class="pi-school-maslak">${escHtml(schoolLine)}</span>
+          </div>
+          <div class="pi-school-status">استرجال ممکن نہیں</div>
+        </div>
+      </div>`;
+  }
+
+  const ans = hasAns ? r.answer : (bad ? r.answer : '—');
+
+  return `
+    <div class="pi-section-school pi-hybrid-section" data-sect="${escHtml(r.sect)}" data-idx="${idx}">
+      <div class="pi-school-bar">
+        <div class="pi-school-avatar">${escHtml(initial)}</div>
+        <div class="pi-school-info">
+          <span class="pi-school-name">${escHtml(label)}</span>
+          <span class="pi-school-maslak">${escHtml(schoolLine)}</span>
+        </div>
+        <div class="pi-school-count">${nSrc ? escHtml(String(nSrc)) + ' chunks' : '—'}</div>
+      </div>
+      <div class="pi-fatwa-list">
+        <div class="pi-fatwa-item pi-fatwa-item--primary">
+          <div class="pi-hybrid-answer">
+            <span class="pi-fatwa-alabel">مولف شدہ جواب:</span>
+            <p class="pi-hybrid-answer-txt">${escHtml(ans || '')}</p>
+          </div>
+          <div class="pi-fatwa-footer">
+            <div class="footer-stats"></div>
+            ${
+              nSrc
+                ? `<button type="button" class="sources-btn">ماخذ (${nSrc})</button>`
+                : ''
+            }
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
 function appendErrorBubble(msg) {
   const el = document.createElement('div');
   el.className = 'msg msg-bot';
@@ -342,15 +440,44 @@ function buildSourceCard(src, rank) {
   const refHtml = ref
     ? `<p class="src-file"><a href="${escHtml(ref)}" target="_blank" rel="noopener noreferrer">🔗 Open fatwa source</a></p>`
     : '';
+
+  const fileLine = (src.source_file || src.fatwa_no)
+    ? `<p class="src-file">${escHtml(src.source_file || src.fatwa_no)}</p>`
+    : '';
+
+  const label = src.source_name || src.maslak || src.category || '—';
+  const scoreTxt = (typeof src.score === 'number') ? src.score.toFixed(3) : (src.score ?? '—');
+  const SECT_LABELS = { deobandi: 'Deobandi', barelvi: 'Barelvi', ahle_hadith: 'Ahle Hadees' };
+  const sectBadge = src.sect
+    ? `<span class="src-sect" style="margin-left:6px;padding:2px 8px;border-radius:10px;background:#eef4ff;color:#2247a6;font-size:11px;font-weight:600;">${escHtml(SECT_LABELS[src.sect] || src.sect)}</span>`
+    : '';
+
+  const question = (src.question || '').trim();
+  const answer   = (src.answer   || '').trim();
+
+  const qBlock = question
+    ? `<div class="src-qa-block">
+         <span class="src-qa-label">سوال (Question):</span>
+         <p class="src-qa-text">${escHtml(question)}</p>
+       </div>` : '';
+
+  const aBlock = answer
+    ? `<div class="src-qa-block">
+         <span class="src-qa-label">جواب (Fatwa):</span>
+         <p class="src-qa-text src-qa-answer">${escHtml(answer)}</p>
+       </div>` : '';
+
   return `
     <div class="src-card">
       <div class="src-header">
-        <span class="src-rank">${rank}</span>
-        <span class="src-cat">${escHtml(src.maslak || src.source_name || src.category || '—')}</span>
-        <span class="src-score">score: ${src.score ?? '—'}</span>
+        <span class="src-rank">#${rank}</span>
+        <span class="src-cat">${escHtml(label)}</span>
+        ${sectBadge}
+        <span class="src-score">score: ${escHtml(scoreTxt)}</span>
       </div>
-      <p class="src-q">${escHtml(src.question || '—')}</p>
-      <p class="src-file">${escHtml(src.source_file || src.fatwa_no || '')}</p>
+      ${qBlock}
+      ${aBlock}
+      ${fileLine}
       ${refHtml}
     </div>`;
 }
@@ -601,37 +728,3 @@ async function onSummariseClick(btn) {
   }
 }
 
-/* ────────────────────────────────────────────────────────────────────────
-   Raw Fatwas mode — inverted index, no LLM, sub-second
-   ──────────────────────────────────────────────────────────────────────── */
-
-async function doRawFatwasSearch(q) {
-  const typingId = appendTyping();
-  setLoading(true);
-
-  try {
-    const resp = await fetch('/api/search_raw_fatwas', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ question: q }),
-    });
-    removeTyping(typingId);
-
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({ error: resp.statusText }));
-      appendErrorBubble(err.error || 'Raw fatwas error');
-      return;
-    }
-    const data = await resp.json();
-    // Reuse the same stacked-sections renderer as PageIndex —
-    // the JSON shape is identical.
-    renderPIResults(data);
-    addHistory(q);
-  } catch (err) {
-    removeTyping(typingId);
-    appendErrorBubble('شبکہ خطا — Network error: ' + err.message);
-  } finally {
-    setLoading(false);
-    scrollBottom();
-  }
-}

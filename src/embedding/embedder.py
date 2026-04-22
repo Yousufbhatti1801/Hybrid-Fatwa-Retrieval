@@ -61,13 +61,21 @@ def _jitter(delay: float) -> float:
     return random.uniform(0, delay)
 
 
-def _call_with_retry(client: OpenAI, texts: list[str]) -> list[list[float]]:
+def _call_with_retry(
+    client: OpenAI,
+    texts: list[str],
+    *,
+    model: str | None = None,
+    dimensions: int | None = None,
+) -> list[list[float]]:
     """Call the embeddings endpoint with exponential back-off.
 
     Retries on RateLimitError (429) and transient 5xx errors.
     Raises immediately on 4xx errors other than 429.
     """
     settings = get_settings()
+    eff_model = model or settings.embedding_model
+    eff_dims = dimensions if dimensions is not None else settings.embedding_dimensions
     delay = settings.embed_base_delay
 
     for attempt in range(1, settings.embed_max_retries + 1):
@@ -75,13 +83,16 @@ def _call_with_retry(client: OpenAI, texts: list[str]) -> list[list[float]]:
             # Explicit timeout — OpenAI SDK default is 600s and has its
             # own internal retries that can silently add 10+s to cold calls.
             # We manage retries ourselves via this loop.
-            response = client.embeddings.create(
+            kwargs = dict(
                 input=texts,
-                model=settings.embedding_model,
-                dimensions=settings.embedding_dimensions,
+                model=eff_model,
                 encoding_format="float",
                 timeout=8.0,
             )
+            # text-embedding-3-* supports optional reduced dimensions (e.g. 1536)
+            if eff_dims and eff_model.startswith("text-embedding-3"):
+                kwargs["dimensions"] = eff_dims
+            response = client.embeddings.create(**kwargs)
             return [item.embedding for item in response.data]
 
         except RateLimitError:
@@ -117,6 +128,22 @@ def _call_with_retry(client: OpenAI, texts: list[str]) -> list[list[float]]:
     raise RuntimeError(
         f"Embedding failed after {settings.embed_max_retries} retries."
     )
+
+
+def embed_texts_islam360(texts: list[str]) -> list[list[float]]:
+    """Embed with Islam360 settings (default: text-embedding-3-small, 1536-dim)."""
+    s = get_settings()
+    return _call_with_retry(
+        _get_client(),
+        texts,
+        model=s.islam360_embedding_model,
+        dimensions=s.islam360_embedding_dimensions,
+    )
+
+
+def embed_query_islam360(text: str) -> list[float]:
+    """Single-query embedding for Islam360 retrieval (1536 dimensions)."""
+    return embed_texts_islam360([text])[0]
 
 
 def _safe_batches(chunks: list[Chunk], max_items: int) -> Iterator[list[Chunk]]:
